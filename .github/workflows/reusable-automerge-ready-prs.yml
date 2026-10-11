@@ -1,0 +1,777 @@
+name: Reusable - Automerge Ready PRs
+
+on:
+  workflow_call:
+    inputs:
+      merge_strategy:
+        description: "gh pr merge strategy: 'merge' or 'squash' (most callers only allow merge commits, but some allow squash)."
+        required: false
+        type: string
+        default: 'merge'
+      match_head_commit:
+        description: "If true, pin the merge (--match-head-commit) to the PR head read in the same poll as its checks, so a push between the last passing poll and the merge call fails loudly instead of merging a commit whose checks were never seen green."
+        required: false
+        type: boolean
+        default: false
+      post_merge_workflows:
+        description: "Space-separated workflow filenames to `gh workflow run --ref <default-branch>` after a successful merge (e.g. 'release.yml deploy.yml'), in this order. Needed because a merge commit pushed by GITHUB_TOKEN never triggers push-based workflows (GitHub's anti-recursion rule). Each is dispatched only if a push of the merge would have started it (its on.push branches/paths filters, read at the merge commit); one without a push path filter always is. Empty = skip, for repos with nothing to re-trigger."
+        required: false
+        type: string
+        default: ''
+      trusted_senders:
+        description: >-
+          JSON array (as a string) of GitHub logins, besides the repository owner
+          account, whose ready/sync events may trigger a merge, e.g. a repository's
+          own bot identity. Most callers omit it.
+        required: false
+        type: string
+        default: '[]'
+      allow_merge_with_no_checks:
+        description: >-
+          Default true: a ready PR merges even when it has no other checks after
+          the grace window. Set false where zero checks means a CI trigger silently
+          did not fire. Has no effect once any check exists: a failed check still
+          blocks the merge and a pending one is still waited for.
+        required: false
+        type: boolean
+        default: true
+      wait_for_pending_checks:
+        description: >-
+          true (default): when other checks are still pending, poll up to
+          120 x 15 s, holding the runner the whole time. This can deadlock when the
+          pending check needs the same runner (e.g. a repository with a single
+          self-hosted runner).
+
+          false: never wait. If a check is pending the job exits green and frees
+          the runner; it runs again when that check's workflow finishes. ONLY set
+          this together with a `workflow_run` trigger in the caller listing, by
+          `name:`, EVERY workflow that reports a check on PRs:
+            workflow_run:
+              workflows: [CI]
+              types: [completed]
+          A pending check from a workflow missing from that list (or from an
+          external app) never re-triggers this, and the PR sits ready and unmerged.
+          The `workflow_run` path always behaves as false.
+        required: false
+        type: boolean
+        default: true
+      runs_on:
+        description: >-
+          JSON array of runner labels for this job. Default `[self-hosted, linux]`,
+          which matches every self-hosted runner of the calling repository,
+          including one reserved for a single workflow. A caller with such a runner
+          passes the labels of its general pool instead, e.g.
+          '["self-hosted", "linux", "general"]'.
+        required: false
+        type: string
+        default: '["self-hosted", "linux"]'
+      hold_label:
+        description: >-
+          A PR carrying this label is never merged by this workflow, checked before
+          every merge attempt (so adding it while checks are still running also
+          stops the merge). Use it where a PR must stay open: plans without draft
+          pull requests have no other way to say "not yet". Removing the label does
+          not re-trigger this workflow on its own unless the caller listens to
+          `unlabeled`; otherwise re-run the job or push to the PR.
+        required: false
+        type: string
+        default: 'hold'
+    secrets:
+      AUTOMERGE_TOKEN:
+        description: >-
+          Optional token (PAT or GitHub App installation token) with the `workflow`
+          scope, used for the merge call when present. GitHub can refuse a
+          GITHUB_TOKEN merge of a PR that changes .github/workflows/ ("refusing to
+          allow a GitHub App to create or update workflow ... without `workflows`
+          permission"); not every such merge is refused. Leave it unset and the
+          workflow behaves as before.
+        required: false
+      RULESET_TOKEN:
+        description: >-
+          Optional fine-grained PAT with only "Administration: write" on the
+          calling repository, used solely to lock a just-merged branch name against
+          being recreated. Kept separate from AUTOMERGE_TOKEN (narrowest credential).
+          GITHUB_TOKEN cannot manage repository rulesets. Leave it unset and that
+          one step is skipped; automerge itself is unaffected.
+        required: false
+
+permissions:
+  contents: write
+  pull-requests: write
+  checks: read
+  statuses: read
+  actions: write
+
+jobs:
+  automerge:
+    runs-on: ${{ fromJSON(inputs.runs_on) }}
+    if: >-
+      (github.event_name == 'pull_request' && github.event.pull_request.draft == false && (github.event.sender.login == '3h4x' || contains(fromJSON(inputs.trusted_senders), github.event.sender.login)))
+      || (github.event_name == 'workflow_run' && github.event.workflow_run.event == 'pull_request')
+    concurrency:
+      group: automerge-${{ github.event.pull_request.head.ref || github.event.workflow_run.head_branch }}
+      cancel-in-progress: false
+    steps:
+      - name: Resolve the PR
+        id: pr
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          EVENT: ${{ github.event_name }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PR_HEAD_REF: ${{ github.event.pull_request.head.ref }}
+          RUN_PR_NUMBER: ${{ github.event.workflow_run.pull_requests[0].number }}
+          RUN_HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+          RUN_NAME: ${{ github.event.workflow_run.name }}
+          TRUSTED: ${{ inputs.trusted_senders }}
+        run: |
+          set -euo pipefail
+
+          if [ "$EVENT" = "pull_request" ]; then
+            {
+              echo "number=$PR_NUMBER"
+              echo "head_sha=$PR_HEAD_SHA"
+              echo "head_ref=$PR_HEAD_REF"
+              echo "proceed=true"
+            } >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          number="$RUN_PR_NUMBER"
+          if [ -z "$number" ]; then
+            number=$(gh api "repos/$REPO/commits/$RUN_HEAD_SHA/pulls" \
+              --jq '[.[] | select(.state == "open")][0].number // empty')
+          fi
+          if [ -z "$number" ]; then
+            echo "$RUN_NAME finished for $RUN_HEAD_SHA, which heads no open PR -- nothing to do."
+            echo "proceed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # shellcheck disable=SC2016 # GraphQL variables, not shell ones
+          pr=$(gh api graphql -F owner="${REPO%/*}" -F name="${REPO#*/}" -F number="$number" -f query='
+            query($owner: String!, $name: String!, $number: Int!) {
+              repository(owner: $owner, name: $name) {
+                pullRequest(number: $number) {
+                  state isDraft headRefOid headRefName
+                  author { login }
+                  timelineItems(itemTypes: [READY_FOR_REVIEW_EVENT], last: 1) {
+                    nodes { ... on ReadyForReviewEvent { actor { login } } }
+                  }
+                }
+              }
+            }' --jq '.data.repository.pullRequest')
+
+          state=$(jq -r .state <<<"$pr")
+          draft=$(jq -r .isDraft <<<"$pr")
+          head_sha=$(jq -r .headRefOid <<<"$pr")
+          readied_by=$(jq -r '.timelineItems.nodes[0].actor.login // .author.login // empty' <<<"$pr")
+
+          skip=""
+          if [ "$state" != "OPEN" ]; then
+            skip="PR #$number is $state"
+          elif [ "$draft" = "true" ]; then
+            skip="PR #$number is a draft"
+          elif [ "$head_sha" != "$RUN_HEAD_SHA" ]; then
+            skip="PR #$number has moved on to $head_sha; that commit's own checks will re-trigger this"
+          elif [ "$readied_by" != "3h4x" ] && ! jq -e --arg u "$readied_by" 'index($u) != null' <<<"$TRUSTED" >/dev/null; then
+            skip="PR #$number was made ready by '$readied_by', who is not a trusted sender"
+          fi
+          if [ -n "$skip" ]; then
+            echo "$skip -- not merging."
+            echo "proceed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          {
+            echo "number=$number"
+            echo "head_sha=$head_sha"
+            echo "head_ref=$(jq -r .headRefName <<<"$pr")"
+            echo "proceed=true"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Wait for all other checks to pass, then merge
+        id: merge
+        if: steps.pr.outputs.proceed == 'true'
+        continue-on-error: ${{ github.event_name == 'workflow_run' }}
+        env:
+          GH_TOKEN: ${{ secrets.AUTOMERGE_TOKEN || secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ steps.pr.outputs.number }}
+          REPO: ${{ github.repository }}
+          SELF_WORKFLOW: ${{ github.workflow }}
+          MERGE_STRATEGY: ${{ inputs.merge_strategy }}
+          MATCH_HEAD_COMMIT: ${{ inputs.match_head_commit }}
+          HEAD_SHA: ${{ steps.pr.outputs.head_sha }}
+          ALLOW_NO_CHECKS: ${{ inputs.allow_merge_with_no_checks }}
+          WAIT_FOR_PENDING: ${{ github.event_name == 'pull_request' && inputs.wait_for_pending_checks }}
+          HOLD_LABEL: ${{ inputs.hold_label }}
+        run: |
+          set -euo pipefail
+
+          NO_CHECKS_GRACE_ATTEMPTS=4
+
+          base_merge_args=(--"$MERGE_STRATEGY" --delete-branch)
+          merge_args=("${base_merge_args[@]}")
+
+          for attempt in $(seq 1 120); do
+            view=$(gh pr view "$PR_NUMBER" --repo "$REPO" --json state,labels)
+            state=$(jq -r .state <<<"$view")
+            if [ "$state" = "OPEN" ] && jq -e --arg l "$HOLD_LABEL" '[.labels[].name] | index($l) != null' <<<"$view" >/dev/null; then
+              echo "PR #$PR_NUMBER has the '$HOLD_LABEL' label -- not merging. Remove the label, then re-run this job (or push) to merge."
+              exit 0
+            fi
+            if [ "$state" = "MERGED" ]; then
+              echo "PR was already merged outside this run -- automerge has nothing left to do."
+              echo "Exiting successfully without dispatching post-merge workflows."
+              exit 0
+            fi
+            if [ "$state" != "OPEN" ]; then
+              echo "PR is $state without a merge -- automerge has nothing left to do."
+              exit 0
+            fi
+
+            merge_args=("${base_merge_args[@]}")
+            if [ "$MATCH_HEAD_COMMIT" = "true" ]; then
+              polled_head=$(gh pr view "$PR_NUMBER" --repo "$REPO" --json headRefOid --jq .headRefOid)
+              merge_args+=(--match-head-commit "${polled_head:-$HEAD_SHA}")
+            fi
+            rows=$(gh pr checks "$PR_NUMBER" --repo "$REPO" --json name,workflow,bucket)
+            others=$(echo "$rows" | jq -c --arg wf "$SELF_WORKFLOW" '[.[] | select(.workflow != $wf)]')
+            total=$(echo "$others" | jq 'length')
+            pending=$(echo "$others" | jq '[.[] | select(.bucket == "pending")] | length')
+            failed=$(echo "$others" | jq '[.[] | select(.bucket == "fail" or .bucket == "cancel")] | length')
+
+            echo "attempt=$attempt total=$total pending=$pending failed=$failed"
+
+            if [ "$failed" -gt 0 ]; then
+              echo "::error::A check failed — not merging."
+              echo "$others" | jq .
+              exit 1
+            fi
+
+            no_checks_ever_coming=false
+            if [ "$total" -eq 0 ] && [ "$attempt" -ge "$NO_CHECKS_GRACE_ATTEMPTS" ]; then
+              no_checks_ever_coming=true
+            fi
+
+            if { [ "$total" -gt 0 ] && [ "$pending" -eq 0 ]; } || { [ "$no_checks_ever_coming" = "true" ] && [ "$ALLOW_NO_CHECKS" = "true" ]; }; then
+              if [ "$total" -eq 0 ]; then
+                echo "No checks ever appeared, but allow_merge_with_no_checks is set for this repo -- merging."
+              else
+                echo "All checks passed. Merging."
+              fi
+              if gh pr merge "${merge_args[@]}" "$PR_NUMBER" --repo "$REPO" 2> "$RUNNER_TEMP/merge-error.txt"; then
+                echo "merged_by_this_run=true" >> "$GITHUB_OUTPUT"
+                exit 0
+              fi
+              cat "$RUNNER_TEMP/merge-error.txt" >&2
+              exit 1
+            fi
+
+            if [ "$no_checks_ever_coming" = "true" ]; then
+              echo "::error::No other checks found for this PR after $attempt attempts -- this caller has allow_merge_with_no_checks: false, so refusing to auto-merge blind rather than using the account-wide default of merging anyway. Likely cause: this repo's CI workflow doesn't trigger for this PR's base branch. Merge manually once you've verified it yourself: gh pr merge ${merge_args[*]} $PR_NUMBER --repo $REPO"
+              exit 1
+            fi
+
+            if [ "$pending" -gt 0 ] && [ "$WAIT_FOR_PENDING" != "true" ]; then
+              echo "::notice::$pending check(s) still pending -- freeing this runner instead of waiting. Automerge runs again when they finish."
+              echo "$others" | jq -c '.[] | select(.bucket == "pending")'
+              exit 0
+            fi
+
+            sleep 15
+          done
+
+          echo "::error::Timed out waiting for checks to finish."
+          exit 1
+
+      - name: Handle an automerge failure
+        if: ${{ !cancelled() && steps.merge.outcome == 'failure' }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ steps.pr.outputs.number }}
+          REPO: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          if grep -q 'without .workflows. permission' "$RUNNER_TEMP/merge-error.txt" 2>/dev/null; then
+            gh pr comment "$PR_NUMBER" --repo "$REPO" --body-file - <<'BODY'
+          **Merge this one by hand** — re-marking it ready will not help.
+
+          GitHub refused the merge because this PR changes a file under
+          `.github/workflows/`, and the token automerge uses lacked the `workflows`
+          permission for this attempt:
+
+          ```
+          refusing to allow a GitHub App to create or update workflow ... without `workflows` permission
+          ```
+
+          This is intermittent, not a rule — PRs touching workflow files usually do
+          automerge fine — so there is nothing to fix on the PR itself. (If it starts
+          happening every time, set an `AUTOMERGE_TOKEN` secret: a PAT with the
+          `workflow` scope, picked up automatically via `secrets: inherit`.)
+
+          **Left ready for review deliberately**, so the merge button stays enabled — a
+          draft PR cannot be merged, which would make the instruction above impossible to
+          follow.
+          BODY
+          else
+            gh pr ready "$PR_NUMBER" --repo "$REPO" --undo
+            gh pr comment "$PR_NUMBER" --repo "$REPO" --body \
+              "Automerge failed, so this PR was moved back to draft instead of being left stuck ready-for-review with failing checks. See the run for why: $RUN_URL. Fix the issue and mark it ready for review again to retry."
+          fi
+
+      - name: Re-trigger post-merge workflows
+        if: inputs.post_merge_workflows != '' && success() && steps.merge.outputs.merged_by_this_run == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ steps.pr.outputs.number }}
+          WORKFLOWS: ${{ inputs.post_merge_workflows }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          set -euo pipefail
+
+          decisions="$RUNNER_TEMP/post-merge-decisions.tsv"
+          filter_log="$RUNNER_TEMP/post-merge-filter.log"
+          filter_ran=false
+          filter_error=""
+          # shellcheck disable=SC2086
+          if python3 - "$REPO" "$PR_NUMBER" "$DEFAULT_BRANCH" $WORKFLOWS > "$decisions" 2> "$filter_log" <<'PY'
+          # Prints one line per listed workflow, "<dispatch|skip>\t<file>\t<reason>". The
+          # bash around this dispatches a workflow unless it reads a well-formed skip line
+          # for it, and dispatches every one of them if this exits non-zero -- so an
+          # error anywhere in here costs an extra run, never a missed deploy.
+          import json
+          import re
+          import subprocess
+          import sys
+          import time
+          import urllib.parse
+
+          import yaml
+
+          DISPATCH, SKIP = "dispatch", "skip"
+
+          class FilterError(Exception):
+              """Something the docs leave undefined, or data we cannot trust: dispatch."""
+
+          # GitHub's filter-pattern syntax, from the "Filter pattern cheat sheet" of
+          # https://docs.github.com/en/actions/reference/workflows-and-actions/workflow-syntax
+          #   *    zero or more characters, not "/"
+          #   **   zero or more of any character; as a whole "**/" segment, zero or more
+          #        directories ("**/README.md" matches "README.md")
+          #   ?    zero or one of the PRECEDING character (not "any one character")
+          #   +    one or more of the preceding character
+          #   [..] one alphanumeric character from a list or an a-z/A-Z/0-9 range
+          #   \    escapes the next character; everything else, "." included, is literal
+          # Anything the docs do not define raises FilterError, so the workflow is
+          # dispatched: "{a,b}" braces, extglob "(", ")", "@", a leading "./" or "/".
+          # Treating those as literals would skip a deploy GitHub may have started.
+          ALNUM = frozenset("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789")
+
+          def compile_glob(pattern):
+              if not isinstance(pattern, str) or not pattern:
+                  raise FilterError(f"pattern {pattern!r} is not a non-empty string")
+              # GitHub matches against repo-relative names with no leading "./" or "/"; a
+              # pattern written that way may or may not be normalised, so do not guess.
+              if pattern.startswith(("./", "/")):
+                  raise FilterError(f"leading './' or '/' in {pattern!r}")
+              out = []  # regex fragments
+              quantifiable = []  # may "?" or "+" follow this fragment
+              i, n = 0, len(pattern)
+              while i < n:
+                  c = pattern[i]
+                  if c == "\\":
+                      if i + 1 >= n:
+                          raise FilterError(f"trailing backslash in {pattern!r}")
+                      out.append(re.escape(pattern[i + 1]))
+                      quantifiable.append(True)
+                      i += 2
+                  elif c == "*":
+                      if pattern.startswith("***", i):
+                          raise FilterError(f"'***' in {pattern!r}")
+                      if pattern.startswith("**", i):
+                          whole_segment = (i == 0 or pattern[i - 1] == "/") and pattern.startswith("**/", i)
+                          out.append("(?:.*/)?" if whole_segment else ".*")
+                          i += 3 if whole_segment else 2
+                      else:
+                          out.append("[^/]*")
+                          i += 1
+                      quantifiable.append(False)
+                  elif c in "?+":
+                      if not out or not quantifiable[-1]:
+                          raise FilterError(f"{c!r} with nothing to repeat in {pattern!r}")
+                      out[-1] += c
+                      quantifiable[-1] = False
+                      i += 1
+                  elif c == "[":
+                      end = pattern.find("]", i + 1)
+                      body = pattern[i + 1:end] if end != -1 else ""
+                      if not body:
+                          raise FilterError(f"unclosed or empty '[' in {pattern!r}")
+                      parts, k = [], 0
+                      while k < len(body):
+                          lo = body[k]
+                          if lo not in ALNUM:
+                              raise FilterError(f"{lo!r} inside [] in {pattern!r}")
+                          if k + 2 < len(body) and body[k + 1] == "-":
+                              hi = body[k + 2]
+                              same_kind = any(lo in s and hi in s for s in ("abcdefghijklmnopqrstuvwxyz", "ABCDEFGHIJKLMNOPQRSTUVWXYZ", "0123456789"))
+                              if not same_kind or hi < lo:
+                                  raise FilterError(f"range {lo}-{hi} in {pattern!r}")
+                              parts.append(f"{lo}-{hi}")
+                              k += 3
+                          else:
+                              parts.append(lo)
+                              k += 1
+                      out.append("[" + "".join(parts) + "]")
+                      quantifiable.append(True)
+                      i = end + 1
+                  elif c == "]":
+                      raise FilterError(f"unmatched ']' in {pattern!r}")
+                  elif c in "{}()@":
+                      # brace expansion / extglob: the docs neither define nor rule them out
+                      raise FilterError(f"{c!r} (brace/extglob syntax) in {pattern!r}")
+                  else:
+                      out.append(re.escape(c))
+                      quantifiable.append(True)
+                      i += 1
+              return re.compile("".join(out), re.DOTALL)
+
+          def include_list_matches(patterns, name):
+              """branches/paths: in order, the last pattern that matches wins; a "!"
+              pattern excludes. A name nothing matches is excluded."""
+              compiled = []
+              for p in patterns:
+                  negative = isinstance(p, str) and p.startswith("!")
+                  compiled.append((negative, compile_glob(p[1:] if negative else p)))
+              if all(negative for negative, _ in compiled):
+                  raise FilterError("only '!' patterns (the docs require a positive one)")
+              included = False
+              for negative, rx in compiled:
+                  if rx.fullmatch(name):
+                      included = not negative
+              return included
+
+          def ignore_list_matches(patterns, name):
+              """branches-ignore/paths-ignore: ignored when any pattern matches."""
+              if any(isinstance(p, str) and p.startswith("!") for p in patterns):
+                  raise FilterError("'!' inside an -ignore list (undocumented)")
+              return any(compile_glob(p).fullmatch(name) for p in patterns)
+
+          def pattern_list(push, key):
+              value = push[key]
+              if isinstance(value, str):
+                  value = [value]
+              if not isinstance(value, list) or not value or not all(isinstance(p, str) for p in value):
+                  raise FilterError(f"push.{key} is not a non-empty list of strings: {value!r}")
+              return value
+
+          PUSH_KEYS = {"branches", "branches-ignore", "tags", "tags-ignore", "paths", "paths-ignore"}
+
+          def decide(workflow_text, branch, files):
+              """Would a push of `files` to `branch` start this workflow? -> (decision, reason)"""
+              try:
+                  doc = yaml.safe_load(workflow_text)
+              except yaml.YAMLError as e:
+                  return DISPATCH, f"cannot parse the workflow ({type(e).__name__})"
+              if not isinstance(doc, dict):
+                  return DISPATCH, "the workflow is not a YAML mapping"
+              if "on" in doc and True in doc:
+                  return DISPATCH, "both 'on' and a key YAML reads as true"
+              on = doc["on"] if "on" in doc else doc.get(True)  # YAML 1.1 reads a bare on: as True
+              if isinstance(on, str):
+                  on = {on: None}
+              elif isinstance(on, list) and all(isinstance(e, str) for e in on):
+                  on = dict.fromkeys(on)
+              if not isinstance(on, dict):
+                  return DISPATCH, f"cannot read its on: block ({on!r})"
+              if "push" not in on:
+                  return DISPATCH, "no push trigger"
+              push = on["push"]
+              if push is None or push == {}:
+                  return DISPATCH, "no push path filter"
+              if not isinstance(push, dict):
+                  return DISPATCH, f"cannot read its push: trigger ({push!r})"
+              unknown = sorted(str(k) for k in push if k not in PUSH_KEYS)
+              if unknown:
+                  return DISPATCH, f"unknown push keys {unknown}"
+              if "paths" not in push and "paths-ignore" not in push:
+                  return DISPATCH, "no push path filter"
+              try:
+                  for a, b in (("branches", "branches-ignore"), ("paths", "paths-ignore")):
+                      if a in push and b in push:
+                          raise FilterError(f"push has both {a} and {b}")
+                  if "branches" not in push and "branches-ignore" not in push:
+                      if "tags" in push or "tags-ignore" in push:
+                          return DISPATCH, "tags-only push trigger (not emulated)"
+                  for key in ("branches", "branches-ignore"):
+                      if key in push and any(p.lstrip("!").startswith("refs/") for p in pattern_list(push, key)):
+                          raise FilterError(f"push.{key} names a full ref (undocumented)")
+                  if "branches" in push and not include_list_matches(pattern_list(push, "branches"), branch):
+                      return SKIP, f"push.branches does not include {branch}"
+                  if "branches-ignore" in push and ignore_list_matches(pattern_list(push, "branches-ignore"), branch):
+                      return SKIP, f"push.branches-ignore excludes {branch}"
+                  if not files:
+                      raise FilterError("no changed files")
+                  if "paths" in push:
+                      patterns = pattern_list(push, "paths")
+                      for f in files:
+                          if include_list_matches(patterns, f):
+                              return DISPATCH, f"{f} matches push.paths"
+                      return SKIP, f"none of the {len(files)} changed paths matches push.paths"
+                  patterns = pattern_list(push, "paths-ignore")
+                  for f in files:
+                      if not ignore_list_matches(patterns, f):
+                          return DISPATCH, f"{f} is not in push.paths-ignore"
+                  return SKIP, f"all {len(files)} changed paths are in push.paths-ignore"
+              except FilterError as e:
+                  return DISPATCH, f"cannot evaluate its push filter: {e}"
+
+          def gh(*args):
+              """`gh <args>` with a few retries; raises FilterError when it keeps failing."""
+              error = ""
+              for attempt in range(3):
+                  if attempt:
+                      time.sleep(attempt)
+                  try:
+                      proc = subprocess.run(["gh", *args], capture_output=True, text=True, timeout=60)
+                  except (OSError, subprocess.TimeoutExpired) as e:
+                      error = f"{type(e).__name__}: {e}"
+                      continue
+                  if proc.returncode == 0:
+                      return proc.stdout
+                  error = (proc.stderr or proc.stdout).strip().replace("\n", " ")[-300:]
+              raise FilterError(f"gh {args[-1]} failed: {error}")
+
+          def changed_paths(repo, pr_number):
+              """Every path the merged PR touched, the old name of a rename included.
+              Returns (merge commit sha, paths). Refuses to guess from a partial list."""
+              pr = json.loads(gh("api", f"repos/{repo}/pulls/{pr_number}"))
+              sha, count, commits = pr.get("merge_commit_sha"), pr.get("changed_files"), pr.get("commits")
+              if pr.get("merged") is not True or not isinstance(sha, str) or not re.fullmatch(r"[0-9a-f]{40}", sha):
+                  raise FilterError(f"PR #{pr_number} is not reported merged with a merge commit")
+              if type(count) is not int or type(commits) is not int:
+                  raise FilterError("the PR has no changed_files/commits counts")
+              if commits >= 1000:
+                  raise FilterError(f"{commits} commits: GitHub runs every push workflow for a push of over 1000 commits")
+              if count == 0:
+                  raise FilterError("the PR reports no changed files")
+              if count >= 3000:
+                  raise FilterError(f"{count} changed files: the files API stops at 3000, so the list would be partial")
+              entries = []
+              for page in range(1, 31):  # 30 pages of 100 = the API's 3000-file cap
+                  batch = json.loads(gh("api", f"repos/{repo}/pulls/{pr_number}/files?per_page=100&page={page}"))
+                  if not isinstance(batch, list):
+                      raise FilterError("the files API did not return a list")
+                  entries += batch
+                  if len(batch) < 100:
+                      break
+              if len(entries) != count:
+                  raise FilterError(f"the files API listed {len(entries)} files, the PR reports {count}")
+              paths = []
+              for entry in entries:
+                  for key in ("filename", "previous_filename"):
+                      value = entry.get(key) if isinstance(entry, dict) else None
+                      if key == "previous_filename" and value is None:
+                          continue
+                      if not isinstance(value, str) or not value:
+                          raise FilterError(f"a files API entry has no usable {key}")
+                      paths.append(value)
+              base = pr.get("base")
+              print(f"PR #{pr_number} merged as {sha} into {base.get('ref') if isinstance(base, dict) else '?'}: "
+                    f"{count} changed file(s), {len(paths)} path(s) counting the old names of renames", file=sys.stderr)
+              return sha, paths
+
+          def main(repo, pr_number, branch, *workflows):
+              sha, paths = changed_paths(repo, pr_number)
+              lines = []
+              for wf in workflows:
+                  try:
+                      if not re.fullmatch(r"[A-Za-z0-9._-]+", wf):
+                          raise FilterError("not a plain workflow file name")
+                      # The file as of the merge commit: what a push of it would have run.
+                      path = urllib.parse.quote(f".github/workflows/{wf}")
+                      text = gh("api", "-H", "Accept: application/vnd.github.raw+json", f"repos/{repo}/contents/{path}?ref={sha}")
+                      decision, reason = decide(text, branch, paths)
+                  except Exception as e:  # noqa: BLE001 -- any failure here means dispatch
+                      decision, reason = DISPATCH, f"{type(e).__name__}: {e}"
+                  reason = re.sub(r"\s+", " ", reason).strip()[:300] or "no reason given"
+                  lines.append(f"{decision}\t{wf}\t{reason}")
+              print("\n".join(lines))
+
+          if __name__ == "__main__":
+              try:
+                  main(*sys.argv[1:])
+              except Exception as e:  # noqa: BLE001 -- the bash dispatches everything on exit 1
+                  print(f"{type(e).__name__}: {e}", file=sys.stderr)
+                  sys.exit(1)
+          PY
+          then
+            filter_ran=true
+          else
+            filter_error=$(tail -n 1 "$filter_log" 2> /dev/null | cut -c 1-300 || true)
+            filter_error=${filter_error:-no output}
+            echo "::warning::The post-merge path filter failed ($filter_error) -- dispatching every listed workflow, as before the filter existed."
+          fi
+          sed 's/^/filter: /' "$filter_log" || true
+
+          selected=""
+          table=""
+          for wf in $WORKFLOWS; do
+            kind=dispatch
+            reason="path filter failed: $filter_error"
+            if [ "$filter_ran" = "true" ]; then
+              line=$(awk -F '\t' -v wf="$wf" '$2 == wf { print; exit }' "$decisions" || true)
+              got_kind="" got_wf="" got_reason=""
+              IFS=$'\t' read -r got_kind got_wf got_reason <<< "$line" || true
+              if [ "$got_wf" = "$wf" ] && [ -n "$got_reason" ] && { [ "$got_kind" = "skip" ] || [ "$got_kind" = "dispatch" ]; }; then
+                kind=$got_kind
+                reason=$got_reason
+              else
+                reason="the path filter gave no decision for it"
+              fi
+            fi
+            echo "$kind $wf: $reason"
+            if [ "$kind" != "skip" ]; then
+              selected="$selected $wf"
+            fi
+            table="$table| \`$wf\` | $kind | ${reason//|/\\|} |"$'\n'
+          done
+
+          {
+            echo "### Post-merge dispatch for #$PR_NUMBER"
+            echo
+            if [ "$filter_ran" = "true" ]; then
+              echo "Dispatched only the listed workflows a push of this merge to \`$DEFAULT_BRANCH\` would have started (their on.push filters, read at the merge commit)."
+            else
+              echo "**The path filter failed, so every listed workflow was dispatched:** $filter_error"
+            fi
+            echo
+            echo "| Workflow | Decision | Why |"
+            echo "|---|---|---|"
+            printf '%s' "$table"
+          } >> "${GITHUB_STEP_SUMMARY:-/dev/null}" || echo "::warning::Could not write the step summary."
+
+          if [ -z "$selected" ]; then
+            echo "Nothing to dispatch: no listed workflow's push filter matches this merge."
+          fi
+          for wf in $selected; do echo "$wf"; done > "$RUNNER_TEMP/post-merge-selected.txt"
+          : > "$RUNNER_TEMP/post-merge-dispatched.txt"
+
+          WAIT_ATTEMPTS=40 # 40 * 15s = 10 minutes per workflow before giving up
+
+          for wf in $selected; do
+            for attempt in $(seq 1 "$WAIT_ATTEMPTS"); do
+              in_flight=$(gh run list --repo "$REPO" --workflow "$wf" --json status \
+                --jq '[.[] | select(.status == "in_progress" or .status == "queued")] | length')
+              if [ "$in_flight" -eq 0 ]; then
+                break
+              fi
+              if [ "$attempt" -eq "$WAIT_ATTEMPTS" ]; then
+                echo "::warning::$wf still has $in_flight run(s) in flight after $WAIT_ATTEMPTS attempts -- dispatching anyway, may race GitHub's own concurrency queue."
+                break
+              fi
+              echo "$wf: $in_flight run(s) in flight, waiting before dispatching another (attempt $attempt/$WAIT_ATTEMPTS)"
+              sleep 15
+            done
+
+            dispatch_ok=false
+            for dispatch_attempt in 1 2 3 4 5; do
+              if gh workflow run "$wf" --repo "$REPO" --ref "$DEFAULT_BRANCH" 2> "$RUNNER_TEMP/dispatch-error.txt"; then
+                dispatch_ok=true
+                break
+              fi
+              echo "::warning::Dispatching $wf failed on attempt $dispatch_attempt/5:"
+              cat "$RUNNER_TEMP/dispatch-error.txt" >&2
+              if [ "$dispatch_attempt" -lt 5 ]; then
+                sleep 10
+              fi
+            done
+            if [ "$dispatch_ok" != "true" ]; then
+              echo "::error::Could not dispatch $wf after 5 attempts -- the merge landed but this workflow was never re-triggered."
+              echo "$wf" >> "$RUNNER_TEMP/failed-dispatches.txt"
+            else
+              echo "$wf" >> "$RUNNER_TEMP/post-merge-dispatched.txt"
+            fi
+          done
+
+          if [ -s "$RUNNER_TEMP/failed-dispatches.txt" ]; then
+            exit 1
+          fi
+
+      - name: Alert when a post-merge dispatch could not be retried into success
+        if: failure() && steps.merge.outputs.merged_by_this_run == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ steps.pr.outputs.number }}
+          REPO: ${{ github.repository }}
+          WORKFLOWS: ${{ inputs.post_merge_workflows }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          selected="$RUNNER_TEMP/post-merge-selected.txt"
+          if [ -f "$selected" ]; then
+            missing=$(grep -vxF -f "$RUNNER_TEMP/post-merge-dispatched.txt" "$selected" 2> /dev/null | xargs || true)
+            WORKFLOWS=${missing:-$WORKFLOWS}
+          fi
+          gh pr comment "$PR_NUMBER" --repo "$REPO" --body \
+            "This PR merged, but re-triggering \`$WORKFLOWS\` failed even after 5 retries -- a merge commit pushed by GITHUB_TOKEN never fires push-based workflows on its own (GitHub's anti-recursion rule), so **this change is merged to main but has not been deployed**. Trigger it by hand: \`gh workflow run <workflow-file> --repo $REPO --ref main\`. Failure details: $RUN_URL"
+
+      - name: Block the merged branch from ever being recreated
+        if: steps.merge.outputs.merged_by_this_run == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.RULESET_TOKEN }}
+          REPO: ${{ github.repository }}
+          BRANCH: ${{ steps.pr.outputs.head_ref }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${GH_TOKEN:-}" ]; then
+            echo "RULESET_TOKEN not set for this repo -- skipping the recreation-lock for $BRANCH. Not fatal: the merge itself already succeeded."
+            exit 0
+          fi
+
+          RULESET_NAME="block-recreated-merged-branches"
+          REF="refs/heads/$BRANCH"
+
+          lock_ok=false
+          for attempt in 1 2 3 4 5; do
+            ruleset_id=$(gh api "repos/$REPO/rulesets" --jq --arg name "$RULESET_NAME" \
+              '.[] | select(.name == $name) | .id' | head -n1)
+
+            if [ -z "$ruleset_id" ]; then
+              body=$(jq -n --arg name "$RULESET_NAME" --arg ref "$REF" '{
+                name: $name, target: "branch", enforcement: "active",
+                conditions: { ref_name: { include: [$ref], exclude: [] } },
+                rules: [ { type: "creation" } ]
+              }')
+              if echo "$body" | gh api "repos/$REPO/rulesets" --input - >/dev/null 2>"$RUNNER_TEMP/ruleset-error.txt"; then
+                lock_ok=true
+                break
+              fi
+            else
+              include=$(gh api "repos/$REPO/rulesets/$ruleset_id" --jq '.conditions.ref_name.include')
+              if echo "$include" | jq -e --arg ref "$REF" 'index($ref) != null' >/dev/null; then
+                lock_ok=true
+                break
+              fi
+              body=$(jq -n --arg name "$RULESET_NAME" --arg ref "$REF" --argjson include "$include" '{
+                name: $name, target: "branch", enforcement: "active",
+                conditions: { ref_name: { include: ($include + [$ref]), exclude: [] } },
+                rules: [ { type: "creation" } ]
+              }')
+              if echo "$body" | gh api "repos/$REPO/rulesets/$ruleset_id" -X PUT --input - >/dev/null 2>"$RUNNER_TEMP/ruleset-error.txt"; then
+                lock_ok=true
+                break
+              fi
+            fi
+
+            echo "::warning::Locking $BRANCH against recreation failed (attempt $attempt/5):"
+            cat "$RUNNER_TEMP/ruleset-error.txt" >&2 2>/dev/null || true
+            sleep $((attempt * 3))
+          done
+
+          if [ "$lock_ok" != "true" ]; then
+            echo "::warning::Could not lock $BRANCH against recreation after 5 attempts -- not fatal, the merge itself already succeeded."
+          fi
