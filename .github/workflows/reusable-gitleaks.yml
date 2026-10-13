@@ -1,0 +1,78 @@
+name: Reusable - Gitleaks
+
+# Secret scanning for private repos, where GitHub's own secret scanning and
+# push protection need Advanced Security.
+#
+# pull_request: scans only the commits the PR adds (base..head), so a leak
+#   fails this check and the automerge workflow refuses to merge it.
+# push: scans only the pushed commits (before..after), so findings already in
+#   history don't turn every later push red.
+# schedule / workflow_dispatch (or a push gitleaks can't diff): full history.
+#
+# Findings are redacted in the log. A repo can tune rules with a root
+# .gitleaks.toml and silence a reviewed false positive by adding its
+# fingerprint to .gitleaksignore; gitleaks picks both up on its own.
+# A real leak must be rotated, not just removed: it stays in git history.
+
+on:
+  workflow_call:
+    inputs:
+      runs_on:
+        description: "Runner label for the job."
+        required: false
+        type: string
+        default: 'datacrash-io-arc'
+
+permissions:
+  contents: read
+
+env:
+  GITLEAKS_VERSION: '8.30.1'
+  GITLEAKS_SHA256: '551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb'
+
+jobs:
+  gitleaks:
+    runs-on: ${{ inputs.runs_on }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Install gitleaks
+        run: |
+          set -euo pipefail
+          tarball="gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          curl -fsSL -o "$RUNNER_TEMP/$tarball" \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/$tarball"
+          echo "${GITLEAKS_SHA256}  $RUNNER_TEMP/$tarball" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/$tarball" -C "$RUNNER_TEMP" gitleaks
+          "$RUNNER_TEMP/gitleaks" version
+
+      - name: Scan
+        env:
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD: ${{ github.event.pull_request.head.sha }}
+          PUSH_BEFORE: ${{ github.event.before }}
+          PUSH_AFTER: ${{ github.event.after }}
+        run: |
+          set -euo pipefail
+          args=(git --redact --no-banner --verbose --exit-code 1)
+          zero=0000000000000000000000000000000000000000
+          if [ -n "$PR_BASE" ] && [ -n "$PR_HEAD" ]; then
+            echo "Scanning PR commits $PR_BASE..$PR_HEAD"
+            args+=(--log-opts="$PR_BASE..$PR_HEAD")
+          elif [ "$GITHUB_EVENT_NAME" = "push" ] && [ -n "$PUSH_BEFORE" ] && [ "$PUSH_BEFORE" != "$zero" ] \
+               && git cat-file -e "$PUSH_BEFORE^{commit}" 2>/dev/null; then
+            # Only what this push added: old findings already in history must not
+            # turn every later push red.
+            echo "Scanning pushed commits $PUSH_BEFORE..$PUSH_AFTER"
+            args+=(--log-opts="$PUSH_BEFORE..$PUSH_AFTER")
+          else
+            echo "Scanning full history"
+          fi
+          if ! "$RUNNER_TEMP/gitleaks" "${args[@]}" .; then
+            echo "::error::gitleaks found secrets (redacted above). Rotate the credential, then remove it from the branch. For a reviewed false positive add its Fingerprint to .gitleaksignore."
+            exit 1
+          fi
