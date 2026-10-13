@@ -74,6 +74,7 @@ jobs:
           persist-credentials: false
 
       - name: Review
+        id: review
         if: steps.key.outputs.present == 'true'
         continue-on-error: true
         # Below the job timeout, so a slow review times out here, where
@@ -114,3 +115,18 @@ jobs:
             --model ${{ inputs.model }}
             --max-turns ${{ inputs.max_turns }}
             --allowedTools "Read,Glob,Grep,mcp__github_inline_comment__create_inline_comment,Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*)"
+
+      - name: Explain a failed review
+        # continue-on-error keeps the check green, and the action hides Claude's output,
+        # so without this a failing review (bad key, no credit, unknown model) is
+        # invisible. Prints only the final result message, which carries the error text
+        # and no repository content.
+        if: steps.review.outcome == 'failure'
+        env:
+          EXECUTION_FILE: ${{ steps.review.outputs.execution_file }}
+        run: |
+          msg="the action failed before Claude produced a result"
+          if [ -n "$EXECUTION_FILE" ] && [ -f "$EXECUTION_FILE" ]; then
+            msg=$(jq -r '[.[] | select(.type == "result")] | last | "\(.subtype // "unknown"): \(.result // "no result text")" | .[0:500]' "$EXECUTION_FILE" 2>/dev/null || echo "unreadable execution file")
+          fi
+          echo "::warning title=Claude review did not complete::$msg"
