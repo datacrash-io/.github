@@ -12,7 +12,10 @@ Shared GitHub Actions workflows for datacrash-io repositories.
   `wait_for_pending_checks: false` the job checks once and exits, and a `workflow_run`
   trigger listing every other workflow that runs on pull requests starts it again when one
   of them finishes, so no job holds a runner while checks run. The input still defaults to
-  `true` (poll and wait) while callers are moved over.
+  `true` (poll and wait) while callers are moved over. A finished run only starts a merge
+  when a trusted sender (the owner account or `trusted_senders`) started it and its head is
+  in this repository, so a run Dependabot started is skipped before a runner is requested.
+  Each run answers for one PR head and stops once the PR has moved on.
 
 ```yaml
 on:
