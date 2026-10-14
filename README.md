@@ -30,7 +30,8 @@ jobs:
   `extra_instructions`, `hold_on`, `hold_label`.
   **Hold:** when the verdict is in `hold_on` (default `needs changes`; add `minor issues` for a
   stricter repo), the review adds the `hold` label, which the automerge workflow refuses to
-  merge. A review that can't finish (API error, timeout, no credential) also holds the PR when
+  merge. A PR from a fork fails this check (it can be neither reviewed nor held), so automerge
+  refuses it. A review that can't finish (API error, timeout, no credential) also holds the PR when
   `hold_on` is set, so an unreviewed head never becomes mergeable; the next completed review
   lifts it. The verdict is never milder than the review's own still-open findings (an open
   high/medium means `needs changes`). Callers trigger on `synchronize` too, so every push is reviewed (automerge waits for that check on

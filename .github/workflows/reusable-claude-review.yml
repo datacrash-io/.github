@@ -105,6 +105,15 @@ jobs:
     # check, and the automerge workflow would then refuse the PR.
     timeout-minutes: 20
     steps:
+      # A fork PR gets a read-only token, no id-token and no secrets: it can be neither
+      # reviewed nor held. Fail this check instead, so automerge refuses it and a person
+      # merges it after reading it.
+      - name: Refuse fork pull requests
+        if: github.event.pull_request.head.repo.full_name != github.repository
+        run: |
+          echo "::error title=No Claude review for fork PRs::This PR comes from a fork, which gets no credentials to review it or to hold it. Merge it by hand after reviewing it."
+          exit 1
+
       # Runs on every push as well (callers trigger on synchronize): automerge waits for
       # this check on the current head, so no commit merges unreviewed.
       - name: Choose how to authenticate
