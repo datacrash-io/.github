@@ -27,7 +27,9 @@ on:
         description: >-
           JSON array (as a string) of GitHub logins, besides the repository owner
           account, whose ready/sync events may trigger a merge, e.g. a repository's
-          own bot identity. Most callers omit it.
+          own bot identity. On the `workflow_run` path both the sender who started
+          the finished run and the one who started that attempt of it (a re-run)
+          must be trusted. Most callers omit it.
         required: false
         type: string
         default: '[]'
@@ -123,10 +125,20 @@ permissions:
 jobs:
   automerge:
     runs-on: ${{ fromJSON(inputs.runs_on) }}
+    # workflow_run: the run that finished must have been started by a trusted sender
+    # (actor), and so must this attempt of it (triggering_actor, which differs on a
+    # re-run), as the pull_request path checks its event's sender. Resolve only checks
+    # who readied the PR, so without this a push by anyone else with write access onto
+    # a PR a trusted sender once readied would merge as soon as its CI completed. Fork
+    # heads never qualify. A run Dependabot started is skipped here, before a runner
+    # is requested.
     if: >-
       (github.event_name == 'pull_request' && github.event.pull_request.draft == false && (github.event.sender.login == '3h4x' || contains(fromJSON(inputs.trusted_senders), github.event.sender.login))
         && (github.event.action != 'unlabeled' || github.event.label.name == inputs.hold_label))
-      || (github.event_name == 'workflow_run' && (github.event.workflow_run.event == 'pull_request' || github.event.workflow_run.event == 'pull_request_target'))
+      || (github.event_name == 'workflow_run' && (github.event.workflow_run.event == 'pull_request' || github.event.workflow_run.event == 'pull_request_target')
+        && github.event.workflow_run.head_repository.full_name == github.repository
+        && (github.event.workflow_run.actor.login == '3h4x' || contains(fromJSON(inputs.trusted_senders), github.event.workflow_run.actor.login))
+        && (github.event.workflow_run.triggering_actor.login == '3h4x' || contains(fromJSON(inputs.trusted_senders), github.event.workflow_run.triggering_actor.login)))
     concurrency:
       group: automerge-${{ github.event.pull_request.head.ref || github.event.workflow_run.head_branch }}
       cancel-in-progress: false
