@@ -9,7 +9,7 @@ on:
         type: string
         default: 'merge'
       match_head_commit:
-        description: "No longer has any effect: the merge is always pinned (--match-head-commit) to the PR head read in the same poll as its checks, and a push that lands in between leaves the merge to that push's own run. Kept so existing callers stay valid."
+        description: "No longer has any effect: the merge is always pinned (--match-head-commit) to the PR head read in the same poll as its checks, and a push that lands in between leaves the merge to that push's own run. A run only ever merges the head it was started for. Kept so existing callers stay valid."
         required: false
         type: boolean
         default: false
@@ -139,8 +139,15 @@ jobs:
         && github.event.workflow_run.head_repository.full_name == github.repository
         && (github.event.workflow_run.actor.login == '3h4x' || contains(fromJSON(inputs.trusted_senders), github.event.workflow_run.actor.login))
         && (github.event.workflow_run.triggering_actor.login == '3h4x' || contains(fromJSON(inputs.trusted_senders), github.event.workflow_run.triggering_actor.login)))
+    # One group per PR head. A group holds one running and one pending run, and a newer
+    # pending run replaces the older one: with a group per branch, a late completion for
+    # an outdated head could replace the pending run for the current head's last
+    # completion, then skip in Resolve, and leave the PR green and unmerged. Runs for the
+    # same head still queue one behind the other. Runs for different heads can now run
+    # side by side, but only the one for the PR's current head can merge: the merge step
+    # stops as soon as the head has moved, and the merge is pinned to that head.
     concurrency:
-      group: automerge-${{ github.event.pull_request.head.ref || github.event.workflow_run.head_branch }}
+      group: automerge-${{ github.event.pull_request.head.ref || github.event.workflow_run.head_branch }}-${{ github.event.workflow_run.head_sha || github.event.pull_request.head.sha }}
       cancel-in-progress: false
     steps:
       - name: Resolve the PR
@@ -270,6 +277,15 @@ jobs:
             # Always pin the merge to the head these checks belong to: a push landing
             # in between makes GitHub refuse it, and that push's own run takes over.
             polled_head=$(gh pr view "$PR_NUMBER" --repo "$REPO" --json headRefOid --jq .headRefOid)
+            # This run answers only for its own head (its event's, which Resolve checked).
+            # Runs for different heads no longer queue one behind the other (see the job's
+            # concurrency group), so one that followed a newer head would race that head's
+            # own run to the same merge, and `gh pr merge` of a PR merged a moment earlier
+            # exits 0, so both would dispatch the post-merge workflows.
+            if [ -n "$polled_head" ] && [ "$polled_head" != "$HEAD_SHA" ]; then
+              echo "::notice::PR #$PR_NUMBER has moved on from $HEAD_SHA to $polled_head -- leaving the merge to that head's own run."
+              exit 0
+            fi
             head="${polled_head:-$HEAD_SHA}"
             merge_args=("${base_merge_args[@]}" --match-head-commit "$head")
             rows=$(gh pr checks "$PR_NUMBER" --repo "$REPO" --json name,workflow,bucket)
