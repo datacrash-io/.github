@@ -288,7 +288,36 @@ jobs:
             fi
             head="${polled_head:-$HEAD_SHA}"
             merge_args=("${base_merge_args[@]}" --match-head-commit "$head")
-            rows=$(gh pr checks "$PR_NUMBER" --repo "$REPO" --json name,workflow,bucket)
+            # A head with no checks at all makes `gh pr checks` exit 1 ("no checks reported
+            # on the '<branch>' branch"): that is zero checks, and the rules below decide.
+            # Any other failure, retried like the runs lookup below, means "cannot verify":
+            # no merge, and no failure either, since a failed step moves the PR back to
+            # draft, and the cause is usually a transient API error, not the PR.
+            checks_ok=false
+            for lookup in 1 2 3; do
+              if rows=$(gh pr checks "$PR_NUMBER" --repo "$REPO" --json name,workflow,bucket 2> "$RUNNER_TEMP/checks-error.txt"); then
+                checks_ok=true
+                break
+              fi
+              if grep -q "^no checks reported on the '" "$RUNNER_TEMP/checks-error.txt"; then
+                rows='[]'
+                checks_ok=true
+                break
+              fi
+              if [ "$lookup" -lt 3 ]; then
+                sleep 5
+              fi
+            done
+            if [ "$checks_ok" != "true" ]; then
+              checks_error=$(tail -n 1 "$RUNNER_TEMP/checks-error.txt" 2> /dev/null | cut -c 1-300 || true)
+              echo "attempt=$attempt checks unknown (${checks_error:-no error output})"
+              if [ "$WAIT_FOR_PENDING" != "true" ]; then
+                echo "::warning::Could not read the checks of PR #$PR_NUMBER -- not merging this time. The next workflow to finish runs this again; if none is left, re-run this job."
+                exit 0
+              fi
+              sleep 15
+              continue
+            fi
             others=$(echo "$rows" | jq -c --arg wf "$SELF_WORKFLOW" '[.[] | select(.workflow != $wf)]')
             total=$(echo "$others" | jq 'length')
             pending_checks=$(echo "$others" | jq '[.[] | select(.bucket == "pending")] | length')
