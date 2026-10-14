@@ -134,13 +134,20 @@ jobs:
       # The reviewer script and its lockfile, always from this repo's main: the same ref
       # the federation rule trusts this workflow at, so a caller can't make the job run
       # other code with that token. Moved out of the workspace the agent can read.
+      # The shared workflows and docs come along as read-only context: callers only
+      # hold a short `uses:` line, and without the source the review can't tell what a
+      # caller's permissions or inputs actually do.
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         if: steps.key.outputs.present == 'true'
         with:
           repository: datacrash-io/.github
           ref: main
           path: .claude-review-tool
-          sparse-checkout: claude-review
+          sparse-checkout: |
+            claude-review
+            .github/workflows
+            CLAUDE.md
+            README.md
           persist-credentials: false
 
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
@@ -153,6 +160,10 @@ jobs:
         run: |
           set -euo pipefail
           mv .claude-review-tool/claude-review "$RUNNER_TEMP/claude-review"
+          # Context for the agent, inside the workspace it may read; never committed.
+          mkdir -p .datacrash-shared
+          mv .claude-review-tool/.github/workflows .datacrash-shared/workflows
+          mv .claude-review-tool/CLAUDE.md .claude-review-tool/README.md .datacrash-shared/
           rm -rf .claude-review-tool
           cd "$RUNNER_TEMP/claude-review" && npm ci --silent --no-audit --no-fund --ignore-scripts
 

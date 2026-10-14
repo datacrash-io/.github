@@ -210,6 +210,12 @@ ${earlier.map((e) => `<finding id="${e.id}" path="${e.path}" line="${e.line}"${e
   const prompt = `You are reviewing pull request #${PR} in ${REPO} (${meta.headRefName} -> ${meta.baseRefName}).
 The repository is checked out in your working directory. Read its CLAUDE.md first if it exists and
 hold the change to its conventions. Read surrounding code where the diff alone is not enough.
+.datacrash-shared/ (not part of this repository or the PR) holds the source of the org's shared
+GitHub workflows from datacrash-io/.github at main, plus that repo's CLAUDE.md and README. When the
+PR touches a workflow that calls one of them (\`uses: datacrash-io/.github/...\`), read the called
+workflow there before judging the caller's permissions, inputs or triggers: a reusable workflow can
+narrow the caller's permissions per job, and the caller file alone doesn't show that. Don't review
+.datacrash-shared/ itself.
 
 Report only problems that matter, most severe first:
 - correctness bugs, broken edge cases, wrong error handling
