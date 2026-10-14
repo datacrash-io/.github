@@ -10,8 +10,8 @@
 // act on GitHub. It returns findings as structured output; this script, not the agent,
 // posts them.
 //
-// Never fails the caller: every error ends in a ::warning:: and exit 0, because the
-// automerge workflow treats a red check as a reason to refuse the PR.
+// Never fails the caller's check (automerge treats red as a refusal): every error ends
+// in a ::warning:: and exit 0. With hold_on set, an error also holds the PR (failClosed).
 
 import { query } from "@anthropic-ai/claude-agent-sdk";
 import { execFileSync } from "node:child_process";
@@ -198,6 +198,28 @@ function replyToThread(threadId, reply) {
     "-F", `t=${threadId}`, "-f", `b=${reply}`]);
 }
 
+const currentHead = () => JSON.parse(gh(["pr", "view", PR, "--repo", REPO, "--json", "headRefOid"])).headRefOid;
+const addHold = () => gh(["api", "--method", "POST", `repos/${REPO}/issues/${PR}/labels`, "--input", "-"], JSON.stringify({ labels: [HOLD_LABEL] }));
+
+// A gate that opens when the reviewer breaks isn't a gate: when hold_on is set and this
+// run reviewed the current head, a review that can't finish holds the PR. The next
+// completed review lifts that hold; a person can remove it sooner.
+function failClosed(title, reason) {
+  warn(title, reason);
+  if (HOLD_ON.length === 0) return;
+  try {
+    if (env.HEAD_SHA && currentHead() !== env.HEAD_SHA) return; // the newer push's review decides
+    if (holdState().held) return;
+    addHold();
+    gh(["api", "--method", "POST", `repos/${REPO}/issues/${PR}/comments`, "--input", "-"], JSON.stringify({
+      body: `:no_entry: **Claude review could not complete** (${title.toLowerCase()}), so this PR is on \`${HOLD_LABEL}\` until a review of it does. Push again or re-run the review job; a person can also remove the label.`,
+    }));
+    console.log(`Added the ${HOLD_LABEL} label: the review could not complete.`);
+  } catch (e) {
+    warn("Could not hold the PR after a failed review", e.message);
+  }
+}
+
 async function main() {
   const meta = JSON.parse(gh(["pr", "view", PR, "--repo", REPO, "--json", "title,body,baseRefName,headRefName"]));
   let diff = gh(["pr", "diff", PR, "--repo", REPO]);
@@ -305,7 +327,7 @@ ${diff}
 
   if (!result || result.subtype !== "success" || result.is_error || !result.structured_output) {
     const why = result ? (result.errors?.join("; ") || result.result || result.subtype) : "no result";
-    warn("Claude review did not complete", why);
+    failClosed("Claude review did not complete", why);
     return;
   }
 
@@ -313,14 +335,31 @@ ${diff}
   // Last line of defence against a prompt-injected PR getting a credential posted.
   const text = JSON.stringify(review);
   if (leaksSecret(text)) {
-    warn("Claude review not posted", "the review text contained one of the job's credentials; nothing was posted.");
+    failClosed("Claude review not posted", "the review text contained one of the job's credentials; nothing was posted.");
     return;
+  }
+  const byId = new Map((review.previous || []).map((p) => [p.id, p]));
+  const closes = (e) => ["fixed", "accepted"].includes(byId.get(e.id)?.status);
+  const fixed = earlier.filter(closes);
+  const stillOpen = earlier.filter((e) => !closes(e));
+  // The verdict can't be milder than the findings still open: enforced here, not left
+  // to the model. An open high/medium means "needs changes", an open low at least
+  // "minor issues".
+  const RANK = ["looks good", "minor issues", "needs changes"];
+  const openRank = Math.max(0, ...stillOpen.map((e) => (/^\*\*(high|medium):/i.test(e.text) ? 2 : 1)));
+  if (openRank > RANK.indexOf(review.verdict)) {
+    console.log(`Verdict raised from "${review.verdict}" to "${RANK[openRank]}" by ${stillOpen.length} still-open earlier finding(s).`);
+    review.verdict = RANK[openRank];
   }
   const hold = HOLD_ON.includes(review.verdict);
   const before = holdState();
-  const holdNote = hold
+  const head = currentHead();
+  const stale = Boolean(env.HEAD_SHA) && head !== env.HEAD_SHA;
+  const holdNote = stale
+    ? `\n_A newer push arrived while this ran; its own review decides the \`${HOLD_LABEL}\` label._`
+    : hold
     ? `\n:no_entry: ${before.held ? `Stays on \`${HOLD_LABEL}\`` : `Added the \`${HOLD_LABEL}\` label`}: automerge won't merge this PR. Push a fix and the review runs again and lifts it when the verdict allows, or remove the label yourself and re-run the automerge job.`
-    : before.held && before.byReview ? `\nThis verdict lifts the \`${HOLD_LABEL}\` label an earlier review added (unless a newer push is being reviewed).` : "";
+    : before.held && before.byReview ? `\nThis verdict lifts the \`${HOLD_LABEL}\` label an earlier review added.` : "";
   const valid = commentableLines(diff);
   const inline = [];
   const elsewhere = [];
@@ -330,10 +369,6 @@ ${diff}
       inline.push({ finding: f, comment: { path: f.path, line: f.line, side: "RIGHT", body: `**${f.severity}: ${f.title}**\n\n${f.body}` } });
     } else elsewhere.push(asListItem(f));
   }
-  const byId = new Map((review.previous || []).map((p) => [p.id, p]));
-  const closes = (e) => ["fixed", "accepted"].includes(byId.get(e.id)?.status);
-  const fixed = earlier.filter(closes);
-  const stillOpen = earlier.filter((e) => !closes(e));
   const previousNote = earlier.length === 0 ? ""
     : `\nEarlier findings: ${fixed.length} fixed or accepted (threads resolved), ${stillOpen.length} still open.`;
   const cost = typeof result.total_cost_usd === "number" ? ` · $${result.total_cost_usd.toFixed(4)}` : "";
@@ -359,20 +394,17 @@ ${diff}
     warn("Inline comments rejected, posting every finding in the review body", e.message);
     post(bodyWith(review.findings.map(asListItem)), []);
   }
-  // Fail closed against a push that landed while this review ran: a hold is added
-  // regardless, but only a review of the current head may lift one.
-  const head = JSON.parse(gh(["pr", "view", PR, "--repo", REPO, "--json", "headRefOid"])).headRefOid;
-  const stale = Boolean(env.HEAD_SHA) && head !== env.HEAD_SHA;
-  if (hold && !before.held) {
-    gh(["api", "--method", "POST", `repos/${REPO}/issues/${PR}/labels`, "--input", "-"], JSON.stringify({ labels: [HOLD_LABEL] }));
+  // Every push gets its own review, so only the review of the current head touches the
+  // label; a review overtaken by a newer push leaves it alone (that one decides, and if
+  // it fails, failClosed holds the PR).
+  if (stale) {
+    console.log(`PR moved on to ${head.slice(0, 7)} since this review started; leaving the ${HOLD_LABEL} label to that push's review.`);
+  } else if (hold && !before.held) {
+    addHold();
     console.log(`Added the ${HOLD_LABEL} label (verdict: ${review.verdict}).`);
   } else if (!hold && before.held && before.byReview) {
-    if (stale) {
-      console.log(`PR moved on to ${head.slice(0, 7)} since this review started; not lifting the ${HOLD_LABEL} label.`);
-    } else {
-      gh(["api", "--method", "DELETE", `repos/${REPO}/issues/${PR}/labels/${encodeURIComponent(HOLD_LABEL)}`]);
-      console.log(`Removed the ${HOLD_LABEL} label the review had added (verdict: ${review.verdict}).`);
-    }
+    gh(["api", "--method", "DELETE", `repos/${REPO}/issues/${PR}/labels/${encodeURIComponent(HOLD_LABEL)}`]);
+    console.log(`Removed the ${HOLD_LABEL} label the review had added (verdict: ${review.verdict}).`);
   }
   // Resolve fixed threads only from a review of the current head; a stale review's
   // "fixed" could describe code a newer push changed again.
@@ -393,4 +425,4 @@ ${diff}
   console.log(`Posted review: ${review.verdict}, ${review.findings.length} finding(s), ${inline.length} inline${cost}`);
 }
 
-main().catch((e) => warn("Claude review failed", e.message));
+main().catch((e) => failClosed("Claude review failed", e.message));

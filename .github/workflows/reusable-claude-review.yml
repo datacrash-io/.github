@@ -7,6 +7,8 @@ name: Reusable - Claude PR Review
 #
 # The check itself never fails: the review step is continue-on-error, so a missing
 # key, an API error or a timeout never turns it red (automerge refuses red checks).
+# With hold_on set, though, such a run holds the PR instead: an unreviewed head is
+# never mergeable just because the reviewer broke.
 # The gate is the hold label: a verdict listed in hold_on adds it, the shared
 # automerge workflow won't merge a PR carrying it, and a passing review of a later
 # push lifts a hold the review placed. A hold a person added is never touched.
@@ -196,6 +198,30 @@ jobs:
           # Used by the script to read the PR and post the review; never passed to the agent.
           GH_TOKEN: ${{ github.token }}
         run: node "$RUNNER_TEMP/claude-review/review.mjs"
+
+      # The script holds the PR itself when a review can't finish, but not when the step
+      # is killed (timeout) or never ran because no credential was available. Same rule:
+      # with hold_on set, an unreviewed current head is held until a review completes.
+      - name: Hold the PR if no review ran
+        if: >-
+          always() && inputs.hold_on != '' &&
+          (steps.key.outputs.present != 'true' || steps.review.outcome == 'failure')
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          HOLD_LABEL: ${{ inputs.hold_label }}
+          WHY: ${{ steps.key.outputs.present != 'true' && 'no Anthropic credential was available' || 'the review step failed or timed out' }}
+        run: |
+          set -euo pipefail
+          head=$(gh pr view "$PR_NUMBER" --repo "$REPO" --json headRefOid --jq .headRefOid)
+          if [ "$head" != "$HEAD_SHA" ]; then echo "A newer push is being reviewed; leaving the label to it."; exit 0; fi
+          if gh api "repos/$REPO/issues/$PR_NUMBER/labels" --jq '.[].name' | grep -qx "$HOLD_LABEL"; then echo "Already on $HOLD_LABEL."; exit 0; fi
+          gh api --method POST "repos/$REPO/issues/$PR_NUMBER/labels" -f "labels[]=$HOLD_LABEL" >/dev/null
+          gh pr comment "$PR_NUMBER" --repo "$REPO" --body ":no_entry: **Claude review could not complete** ($WHY), so this PR is on \`$HOLD_LABEL\` until a review of it does. Push again or re-run the review job; a person can also remove the label."
+          echo "::warning title=PR held::$WHY"
 
   # Resolves the review's own threads that the review job found fixed (it already
   # replied in each). Separate so the job holding contents: write, which the GraphQL
