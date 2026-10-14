@@ -22,8 +22,12 @@ jobs:
   automerge; on push it scans only the pushed commits; on schedule/dispatch the full history. Findings are redacted. Tune with a
   root `.gitleaks.toml`; silence a reviewed false positive via `.gitleaksignore`. Exists
   because GitHub's own secret scanning needs Advanced Security on private repos.
-- `.github/workflows/reusable-claude-review.yml`: advisory PR review by Claude Code
-  (`anthropics/claude-code-action`), inline comments plus one summary comment. Never fails
+- `.github/workflows/reusable-claude-review.yml`: advisory PR review run by
+  `claude-review/review.mjs` on the Claude Agent SDK: one review with inline comments. Not
+  `anthropics/claude-code-action`, because that runs Claude Code, which API credits granted with
+  a Claude plan don't cover. The agent reads the repo but has no shell and no GitHub token; the
+  script posts its findings. Inputs: `model`, `max_turns`, `max_budget_usd` (default 1),
+  `extra_instructions`. Never fails
   the check (missing key, API error, timeout), so it never blocks automerge. Authenticates
   with Workload Identity Federation when the caller passes the `anthropic_*` identifiers and
   grants `id-token: write` (no stored key), otherwise with the `ANTHROPIC_API_KEY` secret;

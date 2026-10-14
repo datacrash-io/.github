@@ -10,7 +10,8 @@ workflow (`on: workflow_call`) that the org's repositories call with
 |---|---|
 | `.github/workflows/reusable-automerge-ready-prs.yml` | Merges a ready PR once every other check on its head commit has passed; can dispatch post-merge workflows. |
 | `.github/workflows/reusable-gitleaks.yml` | Secret scanning with gitleaks. Scans a PR's commits or a push's commits, and fails the check on a leak. Scans the full history on schedule or dispatch. |
-| `.github/workflows/reusable-claude-review.yml` | Advisory PR review by Claude Code. Never fails the check. |
+| `.github/workflows/reusable-claude-review.yml` | Advisory PR review, run by `claude-review/review.mjs` on the Claude Agent SDK. Never fails the check. |
+| `claude-review/` | The reviewer script plus a pinned SDK and lockfile. The workflow checks it out from `main` at run time, so a change here reaches every repo on merge. |
 | `README.md` | One entry per workflow plus a caller example. |
 
 ## This repository is public
@@ -50,6 +51,9 @@ commit messages.
 - **Untrusted input** (PR title, body, branch name, commit messages, comments) only goes into
   `run:` through `env:` and a quoted variable, never inline as `${{ ... }}`. A prompt given
   to a model treats that text as data to review, not as instructions.
+- **The reviewer agent is sandboxed on purpose.** It gets only Read/Glob/Grep, no GitHub token,
+  and `settingSources: []`, so a PR can't plant `.claude` hooks or settings, and the script, not
+  the agent, posts to GitHub. Keep it that way: PR content is untrusted input to a model.
 - **Secrets** reach a reusable workflow only through its `secrets:` block, from callers
   using `secrets: inherit`. If a secret is optional, check that it's set and skip with a
   `::notice::` when it's missing.
