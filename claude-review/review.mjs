@@ -15,7 +15,7 @@
 
 import { query } from "@anthropic-ai/claude-agent-sdk";
 import { execFileSync } from "node:child_process";
-import { mkdirSync, writeFileSync, rmSync, realpathSync } from "node:fs";
+import { mkdirSync, writeFileSync, rmSync, realpathSync, appendFileSync } from "node:fs";
 import { join, resolve, sep } from "node:path";
 
 const env = process.env;
@@ -175,10 +175,11 @@ function openOwnThreads() {
     }));
 }
 
-function resolveThread(threadId, reply) {
+// Replying needs only pull-requests: write. Resolving needs contents: write, so the
+// resolve-threads job does that from the ids this script outputs.
+function replyToThread(threadId, reply) {
   gh(["api", "graphql", "-f", "query=mutation($t:ID!,$b:String!){addPullRequestReviewThreadReply(input:{pullRequestReviewThreadId:$t,body:$b}){clientMutationId}}",
     "-F", `t=${threadId}`, "-f", `b=${reply}`]);
-  gh(["api", "graphql", "-f", "query=mutation($t:ID!){resolveReviewThread(input:{threadId:$t}){thread{isResolved}}}", "-F", `t=${threadId}`]);
 }
 
 async function main() {
@@ -327,16 +328,19 @@ ${diff}
   }
   // Resolve fixed threads only from a review of the current head; a stale review's
   // "fixed" could describe code a newer push changed again.
+  const toResolve = [];
   if (!stale) {
     for (const e of fixed) {
       try {
-        resolveThread(e.threadId, `Fixed as of ${head.slice(0, 7)}: ${byId.get(e.id).note}`);
+        replyToThread(e.threadId, `Fixed as of ${head.slice(0, 7)}: ${byId.get(e.id).note}`);
+        toResolve.push(e.threadId);
       } catch (err) {
-        warn("Could not resolve a fixed review thread", err.message);
+        warn("Could not reply to a fixed review thread", err.message);
       }
     }
   }
-  console.log(`Resolved ${stale ? 0 : fixed.length} fixed thread(s), ${stillOpen.length} still open.`);
+  if (env.GITHUB_OUTPUT) appendFileSync(env.GITHUB_OUTPUT, `resolve=${JSON.stringify(toResolve)}\n`);
+  console.log(`${toResolve.length} fixed thread(s) to resolve, ${stillOpen.length} still open.`);
   console.log(`Posted review: ${review.verdict}, ${review.findings.length} finding(s), ${inline.length} inline${cost}`);
 }
 
