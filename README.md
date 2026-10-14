@@ -56,17 +56,23 @@ on:
 permissions:
   contents: read
   pull-requests: write
-  id-token: write  # federation only
 jobs:
   gitleaks:
     uses: datacrash-io/.github/.github/workflows/reusable-gitleaks.yml@main
   claude-review:
     # Every push is reviewed: automerge waits for this check on the current head.
     if: github.event_name == 'pull_request'
+    # The review job narrows these to contents: read + pull-requests: write +
+    # id-token: write (federation). contents: write is used only by the separate
+    # job that resolves the review's fixed threads; it runs no PR code.
+    permissions:
+      contents: write
+      pull-requests: write
+      id-token: write
     uses: datacrash-io/.github/.github/workflows/reusable-claude-review.yml@main
-    secrets: inherit
     with:
       model: claude-haiku-5-5
+      hold_on: 'needs changes,minor issues'
       # Identifiers, not secrets. Keep them in the private caller, not in this repo.
       anthropic_federation_rule_id: fdrl_...
       anthropic_organization_id: <organization uuid>

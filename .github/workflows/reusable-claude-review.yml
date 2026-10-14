@@ -80,13 +80,20 @@ on:
       ANTHROPIC_API_KEY:
         required: false
 
-# No `permissions:` here on purpose: the job inherits the caller's. Requesting
-# `id-token: write` here would make every caller that does not grant it fail to
-# start (a red check that blocks automerge). Callers grant contents: read and
-# pull-requests: write, plus id-token: write to use federation.
+# No workflow-level `permissions:`. The review job narrows itself to what it needs
+# (every caller grants id-token: write since the federation rollout). The thread
+# job inherits the caller's grant: resolving a review thread needs contents: write,
+# which a caller may not give yet, and requesting it here would stop such a caller
+# from starting at all (a red check that blocks automerge).
 
 jobs:
   review:
+    permissions:
+      contents: read
+      pull-requests: write
+      id-token: write
+    outputs:
+      resolve: ${{ steps.review.outputs.resolve }}
     if: >-
       github.event_name == 'pull_request' &&
       !github.event.pull_request.draft &&
@@ -147,9 +154,10 @@ jobs:
           set -euo pipefail
           mv .claude-review-tool/claude-review "$RUNNER_TEMP/claude-review"
           rm -rf .claude-review-tool
-          cd "$RUNNER_TEMP/claude-review" && npm ci --silent --no-audit --no-fund
+          cd "$RUNNER_TEMP/claude-review" && npm ci --silent --no-audit --no-fund --ignore-scripts
 
       - name: Review
+        id: review
         if: steps.key.outputs.present == 'true'
         continue-on-error: true
         # Below the job timeout, so a slow review times out here, where
@@ -174,3 +182,30 @@ jobs:
           # Used by the script to read the PR and post the review; never passed to the agent.
           GH_TOKEN: ${{ github.token }}
         run: node "$RUNNER_TEMP/claude-review/review.mjs"
+
+  # Resolves the review's own threads that the review job found fixed (it already
+  # replied in each). Separate so the job holding contents: write, which the GraphQL
+  # resolveReviewThread mutation needs, runs no PR code and installs nothing.
+  # Never fails: a caller that doesn't grant contents: write just leaves them open.
+  resolve-threads:
+    needs: review
+    if: needs.review.outputs.resolve != '' && needs.review.outputs.resolve != '[]'
+    runs-on: ${{ inputs.runs_on }}
+    timeout-minutes: 5
+    steps:
+      - name: Resolve fixed threads
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          THREADS: ${{ needs.review.outputs.resolve }}
+        run: |
+          set -uo pipefail
+          # shellcheck disable=SC2016 # $t is a GraphQL variable, not a shell one
+          for t in $(jq -r '.[]' <<<"$THREADS"); do
+            [[ "$t" =~ ^PRRT_[A-Za-z0-9_-]+$ ]] || { echo "::warning::Skipping malformed thread id"; continue; }
+            if gh api graphql -f query='mutation($t:ID!){resolveReviewThread(input:{threadId:$t}){thread{isResolved}}}' -F t="$t" >/dev/null; then
+              echo "Resolved $t"
+            else
+              echo "::warning title=Review thread left open::Could not resolve $t; the caller may not grant contents: write to the review job."
+            fi
+          done

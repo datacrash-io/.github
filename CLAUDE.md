@@ -41,10 +41,11 @@ commit messages.
   why in an `::error::` line.
 - **Runner:** take the label from a `runs_on` input. Don't hardcode `ubuntu-latest`.
 - **Least privilege:** declare `permissions:` explicitly at the top level, and set
-  `persist-credentials: false` on checkout unless a later step pushes. Exception: a reusable
-  workflow that can use a permission only *some* callers grant (e.g. `id-token: write` for
-  federation) declares none and inherits the caller's. Requesting a permission the caller
-  didn't grant makes the run fail to start, and that red check blocks automerge.
+  `persist-credentials: false` on checkout unless a later step pushes. A job in a reusable
+  workflow can't request more than the caller grants: the whole run fails to start, and
+  that red check blocks automerge. So add a permission to the callers first and only then
+  request it here; until then, let the job inherit (as `resolve-threads` does with
+  `contents: write`) and degrade quietly.
 - **Pin third-party actions to a full commit SHA** with the version as a comment
   (`uses: owner/action@<sha> # v1.2.3`). Downloaded binaries need a pinned version and a
   checksum check.
