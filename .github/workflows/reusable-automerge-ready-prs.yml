@@ -67,9 +67,10 @@ on:
         default: '["self-hosted", "linux"]'
       hold_label:
         description: >-
-          A PR carrying this label is never merged by this workflow, checked before
-          every merge attempt (so adding it while checks are still running also
-          stops the merge). Use it where a PR must stay open: plans without draft
+          A PR carrying this label is never merged by this workflow. It is read
+          right before merging, once every other check has finished, so a label
+          added while checks run still stops the merge, and a hold that the Claude
+          review of the same push lifts doesn't stop it. Use it where a PR must stay open: plans without draft
           pull requests have no other way to say "not yet". Removing the label does
           not re-trigger this workflow on its own unless the caller listens to
           `unlabeled`; otherwise re-run the job or push to the PR.
@@ -106,7 +107,8 @@ jobs:
   automerge:
     runs-on: ${{ fromJSON(inputs.runs_on) }}
     if: >-
-      (github.event_name == 'pull_request' && github.event.pull_request.draft == false && (github.event.sender.login == '3h4x' || contains(fromJSON(inputs.trusted_senders), github.event.sender.login)))
+      (github.event_name == 'pull_request' && github.event.pull_request.draft == false && (github.event.sender.login == '3h4x' || contains(fromJSON(inputs.trusted_senders), github.event.sender.login))
+        && (github.event.action != 'unlabeled' || github.event.label.name == inputs.hold_label))
       || (github.event_name == 'workflow_run' && github.event.workflow_run.event == 'pull_request')
     concurrency:
       group: automerge-${{ github.event.pull_request.head.ref || github.event.workflow_run.head_branch }}
@@ -215,12 +217,13 @@ jobs:
           merge_args=("${base_merge_args[@]}")
 
           for attempt in $(seq 1 120); do
-            view=$(gh pr view "$PR_NUMBER" --repo "$REPO" --json state,labels)
+            # The hold label is read only once every check has finished (below), not here:
+            # a fix push starts this run while the previous review's hold is still on the
+            # PR, and that push's Claude review lifts it only when its own check finishes.
+            # Exiting on the stale label now would miss the lift, and a lift done with
+            # GITHUB_TOKEN starts no workflow that could merge later.
+            view=$(gh pr view "$PR_NUMBER" --repo "$REPO" --json state)
             state=$(jq -r .state <<<"$view")
-            if [ "$state" = "OPEN" ] && jq -e --arg l "$HOLD_LABEL" '[.labels[].name] | index($l) != null' <<<"$view" >/dev/null; then
-              echo "PR #$PR_NUMBER has the '$HOLD_LABEL' label -- not merging. Remove the label, then re-run this job (or push) to merge."
-              exit 0
-            fi
             if [ "$state" = "MERGED" ]; then
               echo "PR was already merged outside this run -- automerge has nothing left to do."
               echo "Exiting successfully without dispatching post-merge workflows."
@@ -256,6 +259,11 @@ jobs:
             fi
 
             if { [ "$total" -gt 0 ] && [ "$pending" -eq 0 ]; } || { [ "$no_checks_ever_coming" = "true" ] && [ "$ALLOW_NO_CHECKS" = "true" ]; }; then
+              if gh pr view "$PR_NUMBER" --repo "$REPO" --json labels --jq '.labels[].name' | grep -qxF "$HOLD_LABEL"; then
+                echo "::notice::PR #$PR_NUMBER has the '$HOLD_LABEL' label -- not merging. A fix push re-runs this after its review; removing the label re-runs it too."
+                echo "### Not merged: PR #$PR_NUMBER is on \`$HOLD_LABEL\`" >> "$GITHUB_STEP_SUMMARY"
+                exit 0
+              fi
               if [ "$total" -eq 0 ]; then
                 echo "No checks ever appeared, but allow_merge_with_no_checks is set for this repo -- merging."
               else
