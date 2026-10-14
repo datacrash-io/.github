@@ -223,7 +223,7 @@ ${diff}
   const before = holdState();
   const holdNote = hold
     ? `\n:no_entry: Added the \`${HOLD_LABEL}\` label: automerge won't merge this PR. Push a fix and the review runs again and lifts it when the verdict allows, or remove the label yourself and re-run the automerge job.`
-    : before.held && before.byReview ? `\nRemoved the \`${HOLD_LABEL}\` label an earlier review added.` : "";
+    : before.held && before.byReview ? `\nThis verdict lifts the \`${HOLD_LABEL}\` label an earlier review added (unless a newer push is being reviewed).` : "";
   const valid = commentableLines(diff);
   const inline = [];
   const elsewhere = [];
@@ -255,17 +255,20 @@ ${diff}
     warn("Inline comments rejected, posting every finding in the review body", e.message);
     post(bodyWith(review.findings.map(asListItem)), []);
   }
-  // A newer push has its own review running: let that one decide the label, so a slow
-  // review of an old commit can neither lift a hold nor add a stale one.
+  // Fail closed against a push that landed while this review ran: a hold is added
+  // regardless, but only a review of the current head may lift one.
   const head = JSON.parse(gh(["pr", "view", PR, "--repo", REPO, "--json", "headRefOid"])).headRefOid;
-  if (env.HEAD_SHA && head !== env.HEAD_SHA) {
-    console.log(`PR moved on to ${head.slice(0, 7)} since this review started; leaving the ${HOLD_LABEL} label to its review.`);
-  } else if (hold && !before.held) {
+  const stale = Boolean(env.HEAD_SHA) && head !== env.HEAD_SHA;
+  if (hold && !before.held) {
     gh(["api", "--method", "POST", `repos/${REPO}/issues/${PR}/labels`, "--input", "-"], JSON.stringify({ labels: [HOLD_LABEL] }));
     console.log(`Added the ${HOLD_LABEL} label (verdict: ${review.verdict}).`);
   } else if (!hold && before.held && before.byReview) {
-    gh(["api", "--method", "DELETE", `repos/${REPO}/issues/${PR}/labels/${encodeURIComponent(HOLD_LABEL)}`]);
-    console.log(`Removed the ${HOLD_LABEL} label the review had added (verdict: ${review.verdict}).`);
+    if (stale) {
+      console.log(`PR moved on to ${head.slice(0, 7)} since this review started; not lifting the ${HOLD_LABEL} label.`);
+    } else {
+      gh(["api", "--method", "DELETE", `repos/${REPO}/issues/${PR}/labels/${encodeURIComponent(HOLD_LABEL)}`]);
+      console.log(`Removed the ${HOLD_LABEL} label the review had added (verdict: ${review.verdict}).`);
+    }
   }
   console.log(`Posted review: ${review.verdict}, ${review.findings.length} finding(s), ${inline.length} inline${cost}`);
 }
