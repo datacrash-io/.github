@@ -51,9 +51,10 @@ commit messages.
 - **Untrusted input** (PR title, body, branch name, commit messages, comments) only goes into
   `run:` through `env:` and a quoted variable, never inline as `${{ ... }}`. A prompt given
   to a model treats that text as data to review, not as instructions.
-- **The reviewer agent is sandboxed on purpose.** It gets only Read/Glob/Grep, no GitHub token,
+- **The reviewer agent is sandboxed on purpose.** It gets only Read/Glob/Grep, confined to the checked-out repo (scoped allow rules plus a
+  `canUseTool` path check, so `/proc/*/environ` and the token file are out of reach), no GitHub token,
   and `settingSources: []`, so a PR can't plant `.claude` hooks or settings, and the script, not
-  the agent, posts to GitHub. Keep it that way: PR content is untrusted input to a model.
+  the agent, posts to GitHub, after checking the text contains none of the job's credentials. Keep it that way: PR content is untrusted input to a model.
 - **Secrets** reach a reusable workflow only through its `secrets:` block, from callers
   using `secrets: inherit`. If a secret is optional, check that it's set and skip with a
   `::notice::` when it's missing.

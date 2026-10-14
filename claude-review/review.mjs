@@ -15,8 +15,8 @@
 
 import { query } from "@anthropic-ai/claude-agent-sdk";
 import { execFileSync } from "node:child_process";
-import { mkdirSync, writeFileSync, rmSync } from "node:fs";
-import { join } from "node:path";
+import { mkdirSync, writeFileSync, rmSync, realpathSync } from "node:fs";
+import { join, resolve, sep } from "node:path";
 
 const env = process.env;
 const REPO = env.REPO;
@@ -26,6 +26,10 @@ const MAX_TURNS = Number(env.MAX_TURNS || 25);
 const MAX_BUDGET_USD = Number(env.MAX_BUDGET_USD || 1);
 const EXTRA = env.EXTRA_INSTRUCTIONS || "";
 const MAX_DIFF_CHARS = 150_000;
+
+// Every credential the job holds. The agent's output is checked against these before
+// anything is posted.
+const secretValues = new Set([env.ANTHROPIC_API_KEY, env.GH_TOKEN, env.ACTIONS_ID_TOKEN_REQUEST_TOKEN].filter((v) => v && v.length >= 8));
 
 const warn = (title, msg) => console.log(`::warning title=${title}::${String(msg).replace(/\r?\n/g, " ").slice(0, 900)}`);
 
@@ -63,6 +67,7 @@ async function federationEnv(dir) {
     if (!res.ok) throw new Error(`GitHub OIDC token request failed: HTTP ${res.status}`);
     const { value } = await res.json();
     console.log(`::add-mask::${value}`);
+    secretValues.add(value);
     writeFileSync(tokenFile, value, { mode: 0o600 });
   };
   mkdirSync(join(dir, "config", "configs"), { recursive: true, mode: 0o700 });
@@ -83,6 +88,23 @@ async function federationEnv(dir) {
     ANTHROPIC_CONFIG_DIR: join(dir, "config"),
     ANTHROPIC_PROFILE: "default",
   };
+}
+
+// The agent may only touch the checked-out repository. Scoped allow rules cover the
+// normal case; this check runs for anything they don't match, resolves symlinks, and
+// denies every path outside the workspace (/proc/*/environ, the OIDC token file, $HOME).
+const WORKSPACE = realpathSync(env.GITHUB_WORKSPACE);
+function insideWorkspace(p) {
+  if (!p) return true; // Glob/Grep without a path search the cwd, which is the workspace
+  let real;
+  try { real = realpathSync(resolve(WORKSPACE, p)); } catch { real = resolve(WORKSPACE, p); }
+  return real === WORKSPACE || real.startsWith(WORKSPACE + sep);
+}
+async function canUseTool(toolName, input) {
+  if (["Read", "Glob", "Grep"].includes(toolName) && insideWorkspace(input.file_path ?? input.path)) {
+    return { behavior: "allow", updatedInput: input };
+  }
+  return { behavior: "deny", message: "Only read-only access inside the repository is allowed." };
 }
 
 const SCHEMA = {
@@ -155,8 +177,10 @@ ${diff}
         maxBudgetUsd: MAX_BUDGET_USD,
         cwd: env.GITHUB_WORKSPACE,
         tools: ["Read", "Glob", "Grep"],
-        allowedTools: ["Read", "Glob", "Grep"],
-        permissionMode: "dontAsk",
+        // No bare "Read": that would approve any path. Everything else goes through canUseTool.
+        allowedTools: ["Read(./**)", "Glob(./**)", "Grep(./**)"],
+        permissionMode: "default",
+        canUseTool,
         settingSources: [],
         env: agentEnv,
         outputFormat: { type: "json_schema", schema: SCHEMA },
@@ -177,6 +201,12 @@ ${diff}
   }
 
   const review = result.structured_output;
+  // Last line of defence against a prompt-injected PR getting a credential posted.
+  const text = JSON.stringify(review);
+  if ([...secretValues].some((v) => text.includes(v))) {
+    warn("Claude review not posted", "the review text contained one of the job's credentials; nothing was posted.");
+    return;
+  }
   const valid = commentableLines(diff);
   const inline = [];
   const elsewhere = [];
