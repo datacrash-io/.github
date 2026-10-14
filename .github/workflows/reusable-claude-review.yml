@@ -1,21 +1,21 @@
 name: Reusable - Claude PR Review
 
-# Advisory code review of a pull request, run with the Claude Agent SDK
+# Code review of every push to a pull request, run with the Claude Agent SDK
 # (claude-review/review.mjs): one review with inline comments for concrete problems.
 # Not anthropics/claude-code-action: that runs Claude Code, which API credits granted
 # with a Claude plan don't cover, while they do cover the Agent SDK.
 #
-# Advisory by design: the review step is continue-on-error, so a missing key,
-# an API error or a timeout never fails this check and never
-# blocks the automerge workflow (which waits for every other check to finish).
-# A finding is a comment for whoever reads the PR, not a merge gate.
+# The check itself never fails: the review step is continue-on-error, so a missing
+# key, an API error or a timeout never turns it red (automerge refuses red checks).
+# The gate is the hold label: a verdict listed in hold_on adds it, the shared
+# automerge workflow won't merge a PR carrying it, and a passing review of a later
+# push lifts a hold the review placed. A hold a person added is never touched.
 #
 # Auth: Workload Identity Federation when the caller passes the anthropic_*
 # identifiers and grants `id-token: write` (no stored key: the job's GitHub OIDC
 # token is exchanged for a short-lived Anthropic token); otherwise the
-# ANTHROPIC_API_KEY secret. Every run calls the Claude API. Callers
-# trigger it on opened/reopened/ready_for_review rather than every push, and pick
-# the model per repo: claude-sonnet-5-5 where funds, keys or infrastructure are
+# ANTHROPIC_API_KEY secret. Every run calls the Claude API (well under a cent on
+# Haiku). Callers pick the model per repo: claude-sonnet-5-5 where funds, keys or infrastructure are
 # at stake, claude-haiku-5-5 elsewhere.
 
 on:
@@ -31,6 +31,16 @@ on:
         required: false
         type: number
         default: 25
+      hold_on:
+        description: "Comma-separated verdicts that make the review add the hold label, which the shared automerge workflow refuses to merge: 'needs changes' (default), add 'minor issues' for a stricter repo, or '' to never hold."
+        required: false
+        type: string
+        default: 'needs changes'
+      hold_label:
+        description: "Label the review adds to hold a PR; must match the automerge workflow's hold_label."
+        required: false
+        type: string
+        default: 'hold'
       max_budget_usd:
         description: "Stop a review once its estimated cost reaches this many USD."
         required: false
@@ -86,6 +96,8 @@ jobs:
     # check, and the automerge workflow would then refuse the PR.
     timeout-minutes: 20
     steps:
+      # Runs on every push as well (callers trigger on synchronize): automerge waits for
+      # this check on the current head, so no commit merges unreviewed.
       - name: Choose how to authenticate
         id: key
         env:
@@ -150,6 +162,9 @@ jobs:
           MAX_TURNS: ${{ inputs.max_turns }}
           MAX_BUDGET_USD: ${{ inputs.max_budget_usd }}
           EXTRA_INSTRUCTIONS: ${{ inputs.extra_instructions }}
+          HOLD_ON: ${{ inputs.hold_on }}
+          HOLD_LABEL: ${{ inputs.hold_label }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           AUTH_MODE: ${{ steps.key.outputs.mode }}
           ANTHROPIC_API_KEY: ${{ steps.key.outputs.mode == 'key' && secrets.ANTHROPIC_API_KEY || '' }}
           ANTHROPIC_FEDERATION_RULE_ID: ${{ inputs.anthropic_federation_rule_id }}

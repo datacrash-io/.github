@@ -10,7 +10,7 @@ workflow (`on: workflow_call`) that the org's repositories call with
 |---|---|
 | `.github/workflows/reusable-automerge-ready-prs.yml` | Merges a ready PR once every other check on its head commit has passed; can dispatch post-merge workflows. |
 | `.github/workflows/reusable-gitleaks.yml` | Secret scanning with gitleaks. Scans a PR's commits or a push's commits, and fails the check on a leak. Scans the full history on schedule or dispatch. |
-| `.github/workflows/reusable-claude-review.yml` | Advisory PR review, run by `claude-review/review.mjs` on the Claude Agent SDK. Never fails the check. |
+| `.github/workflows/reusable-claude-review.yml` | PR review, run by `claude-review/review.mjs` on the Claude Agent SDK. Never fails the check. On a verdict in `hold_on` it adds the `hold` label, which stops automerge, and it lifts its own hold after a passing re-review. Reviews every push. |
 | `claude-review/` | The reviewer script plus a pinned SDK and lockfile. The workflow checks it out from `main` at run time, so a change here reaches every repo on merge. |
 | `README.md` | One entry per workflow plus a caller example. |
 

@@ -26,6 +26,9 @@ const MAX_TURNS = Number(env.MAX_TURNS || 25);
 const MAX_BUDGET_USD = Number(env.MAX_BUDGET_USD || 1);
 const EXTRA = env.EXTRA_INSTRUCTIONS || "";
 const MAX_DIFF_CHARS = 150_000;
+const HOLD_LABEL = env.HOLD_LABEL || "hold";
+const HOLD_ON = (env.HOLD_ON ?? "needs changes").split(",").map((v) => v.trim().toLowerCase()).filter(Boolean);
+const BOT = "github-actions[bot]";
 
 // Every credential the job holds. The agent's output is checked against these before
 // anything is posted.
@@ -130,6 +133,15 @@ const SCHEMA = {
   required: ["verdict", "summary", "findings"],
 };
 
+// The hold label stops the shared automerge workflow. The review only ever removes a
+// hold it placed itself, never one a person added.
+function holdState() {
+  const labels = JSON.parse(gh(["api", `repos/${REPO}/issues/${PR}/labels`])).map((l) => l.name);
+  const lastBy = gh(["api", `repos/${REPO}/issues/${PR}/events`, "--paginate",
+    "--jq", `.[] | select(.event == "labeled" and .label.name == "${HOLD_LABEL}") | .actor.login`]).trim().split("\n").pop();
+  return { held: labels.includes(HOLD_LABEL), byReview: lastBy === BOT };
+}
+
 async function main() {
   const meta = JSON.parse(gh(["pr", "view", PR, "--repo", REPO, "--json", "title,body,baseRefName,headRefName"]));
   let diff = gh(["pr", "diff", PR, "--repo", REPO]);
@@ -207,6 +219,11 @@ ${diff}
     warn("Claude review not posted", "the review text contained one of the job's credentials; nothing was posted.");
     return;
   }
+  const hold = HOLD_ON.includes(review.verdict);
+  const before = holdState();
+  const holdNote = hold
+    ? `\n:no_entry: Added the \`${HOLD_LABEL}\` label: automerge won't merge this PR. Push a fix and the review runs again and lifts it when the verdict allows, or remove the label yourself and re-run the automerge job.`
+    : before.held && before.byReview ? `\nThis verdict lifts the \`${HOLD_LABEL}\` label an earlier review added (unless a newer push is being reviewed).` : "";
   const valid = commentableLines(diff);
   const inline = [];
   const elsewhere = [];
@@ -223,6 +240,7 @@ ${diff}
     review.summary,
     listed.length ? `\n${listed.join("\n")}` : "",
     review.findings.length === 0 ? "\nNothing worth raising." : "",
+    holdNote,
     truncated ? `\n_The diff was longer than ${MAX_DIFF_CHARS} characters; only the first part was reviewed._` : "",
     `\n<sub>Advisory review by ${MODEL}${cost}. Never blocks a merge.</sub>`,
   ].filter(Boolean).join("\n");
@@ -236,6 +254,21 @@ ${diff}
     // every finding in the body instead, so none is lost.
     warn("Inline comments rejected, posting every finding in the review body", e.message);
     post(bodyWith(review.findings.map(asListItem)), []);
+  }
+  // Fail closed against a push that landed while this review ran: a hold is added
+  // regardless, but only a review of the current head may lift one.
+  const head = JSON.parse(gh(["pr", "view", PR, "--repo", REPO, "--json", "headRefOid"])).headRefOid;
+  const stale = Boolean(env.HEAD_SHA) && head !== env.HEAD_SHA;
+  if (hold && !before.held) {
+    gh(["api", "--method", "POST", `repos/${REPO}/issues/${PR}/labels`, "--input", "-"], JSON.stringify({ labels: [HOLD_LABEL] }));
+    console.log(`Added the ${HOLD_LABEL} label (verdict: ${review.verdict}).`);
+  } else if (!hold && before.held && before.byReview) {
+    if (stale) {
+      console.log(`PR moved on to ${head.slice(0, 7)} since this review started; not lifting the ${HOLD_LABEL} label.`);
+    } else {
+      gh(["api", "--method", "DELETE", `repos/${REPO}/issues/${PR}/labels/${encodeURIComponent(HOLD_LABEL)}`]);
+      console.log(`Removed the ${HOLD_LABEL} label the review had added (verdict: ${review.verdict}).`);
+    }
   }
   console.log(`Posted review: ${review.verdict}, ${review.findings.length} finding(s), ${inline.length} inline${cost}`);
 }
