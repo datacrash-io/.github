@@ -136,7 +136,7 @@ jobs:
           echo "mode=$mode" >> "$GITHUB_OUTPUT"
           echo "present=$([ "$mode" = none ] && echo false || echo true)" >> "$GITHUB_OUTPUT"
 
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         if: steps.key.outputs.present == 'true'
         with:
           fetch-depth: 1
@@ -148,7 +148,7 @@ jobs:
       # The shared workflows and docs come along as read-only context: callers only
       # hold a short `uses:` line, and without the source the review can't tell what a
       # caller's permissions or inputs actually do.
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         if: steps.key.outputs.present == 'true'
         with:
           repository: datacrash-io/.github
