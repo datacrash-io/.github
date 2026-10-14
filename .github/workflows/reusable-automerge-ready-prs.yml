@@ -126,7 +126,7 @@ jobs:
     if: >-
       (github.event_name == 'pull_request' && github.event.pull_request.draft == false && (github.event.sender.login == '3h4x' || contains(fromJSON(inputs.trusted_senders), github.event.sender.login))
         && (github.event.action != 'unlabeled' || github.event.label.name == inputs.hold_label))
-      || (github.event_name == 'workflow_run' && github.event.workflow_run.event == 'pull_request')
+      || (github.event_name == 'workflow_run' && (github.event.workflow_run.event == 'pull_request' || github.event.workflow_run.event == 'pull_request_target'))
     concurrency:
       group: automerge-${{ github.event.pull_request.head.ref || github.event.workflow_run.head_branch }}
       cancel-in-progress: false
@@ -272,38 +272,50 @@ jobs:
             # So does a pull_request run of this head that has not completed, check or
             # no check: a run queued on a concurrency group has no check run yet, so
             # `gh pr checks` cannot see it, and a PR merged red that way. Only
-            # pull_request(_target) runs count: push and workflow_run runs share the
-            # head SHA but never re-trigger this, so waiting on them could hold a PR
-            # forever. This workflow's own runs are left out by name, as its checks are
-            # above (github.workflow is the caller's name, which is the run's name).
+            # pull_request(_target) runs count: a push or workflow_dispatch run of the PR
+            # branch has the same head SHA but never re-triggers this, so waiting on it
+            # could hold a PR forever (a workflow_run run carries the default branch's
+            # SHA, so it never matches). This workflow's own runs are left out by name,
+            # as its checks are above (github.workflow is the caller's name, which is
+            # the run's name).
             # A lookup that keeps failing means "cannot verify", never "none".
-            runs_ok=false
+            # The runs are listed only when the checks alone would let this attempt merge
+            # (nothing pending, or no checks at all). While a check is pending or failed,
+            # the attempt does not merge whatever the runs say, and skipping the call keeps
+            # a 30-minute poll from spending GITHUB_TOKEN's per-repository REST budget,
+            # which every other workflow of the repository draws on too.
+            pending=$((pending_checks + absent))
+            runs_ok=true
+            running=0
+            running_shown="not listed, a check is pending or failed"
             unfinished='[]'
-            for lookup in 1 2 3; do
-              # `gh api --jq` takes no --arg, so the name filter runs in a separate jq.
-              if runs=$(GH_TOKEN="$RUNS_TOKEN" gh api --paginate \
-                  "repos/$REPO/actions/runs?head_sha=$head&per_page=100" \
-                  --jq '.workflow_runs[] | {name, event, status, url: .html_url}' \
-                  2> "$RUNNER_TEMP/runs-error.txt") \
-                && unfinished=$(jq -sc --arg wf "$SELF_WORKFLOW" '[.[]
-                  | select(.event == "pull_request" or .event == "pull_request_target")
-                  | select(.status != "completed" and .name != $wf)]' <<< "$runs"); then
-                runs_ok=true
-                break
+            if [ "$failed" -eq 0 ] && { [ "$pending" -eq 0 ] || [ "$total" -eq 0 ]; }; then
+              runs_ok=false
+              for lookup in 1 2 3; do
+                # `gh api --jq` takes no --arg, so the name filter runs in a separate jq.
+                if runs=$(GH_TOKEN="$RUNS_TOKEN" gh api --paginate \
+                    "repos/$REPO/actions/runs?head_sha=$head&per_page=100" \
+                    --jq '.workflow_runs[] | {name, event, status, url: .html_url}' \
+                    2> "$RUNNER_TEMP/runs-error.txt") \
+                  && unfinished=$(jq -sc --arg wf "$SELF_WORKFLOW" '[.[]
+                    | select(.event == "pull_request" or .event == "pull_request_target")
+                    | select(.status != "completed" and .name != $wf)]' <<< "$runs"); then
+                  runs_ok=true
+                  break
+                fi
+                if [ "$lookup" -lt 3 ]; then
+                  sleep 5
+                fi
+              done
+              if [ "$runs_ok" = "true" ]; then
+                running=$(jq 'length' <<< "$unfinished")
+                running_shown="$running $(jq -c 'map("\(.name):\(.status)")' <<< "$unfinished")"
+              else
+                runs_error=$(tail -n 1 "$RUNNER_TEMP/runs-error.txt" 2> /dev/null | cut -c 1-300 || true)
+                running_shown="unknown (${runs_error:-no error output})"
               fi
-              if [ "$lookup" -lt 3 ]; then
-                sleep 5
-              fi
-            done
-            if [ "$runs_ok" = "true" ]; then
-              running=$(jq 'length' <<< "$unfinished")
-              running_shown="$running $(jq -c 'map("\(.name):\(.status)")' <<< "$unfinished")"
-            else
-              runs_error=$(tail -n 1 "$RUNNER_TEMP/runs-error.txt" 2> /dev/null | cut -c 1-300 || true)
-              running=0
-              running_shown="unknown (${runs_error:-no error output})"
             fi
-            pending=$((pending_checks + absent + running))
+            pending=$((pending + running))
 
             echo "attempt=$attempt total=$total pending=$pending (not yet reported: $absent, unfinished pull_request runs: $running_shown) failed=$failed"
 
@@ -357,7 +369,7 @@ jobs:
             fi
 
             if [ "$pending" -gt 0 ] && [ "$WAIT_FOR_PENDING" != "true" ]; then
-              echo "::notice::Still pending: $pending_checks check(s), $absent required workflow(s) not yet reported, $running unfinished pull_request run(s) -- freeing this runner instead of waiting. Automerge runs again when they finish."
+              echo "::notice::Still pending: $pending_checks check(s), $absent required workflow(s) not yet reported, unfinished pull_request runs: $running_shown -- freeing this runner instead of waiting. Automerge runs again when they finish."
               echo "$others" | jq -c '.[] | select(.bucket == "pending")'
               jq -c '.[]' <<< "$unfinished"
               exit 0
@@ -823,14 +835,17 @@ jobs:
             # Not `gh api --jq --arg ...`: --jq takes no --arg, so gh read "--arg" as
             # the filter, rejected the extra arguments and ended the step on the
             # first attempt. A failed lookup now goes through the retry below.
-            if ! rulesets=$(gh api "repos/$REPO/rulesets" 2>"$RUNNER_TEMP/ruleset-error.txt"); then
+            # --paginate prints one array per page; `jq -s add` joins them, so a repository
+            # with more than one page of rulesets still finds this one instead of trying
+            # to create a second ruleset with the same name.
+            if ! rulesets=$(gh api --paginate "repos/$REPO/rulesets?per_page=100" 2>"$RUNNER_TEMP/ruleset-error.txt"); then
               echo "::warning::Listing the rulesets failed (attempt $attempt/5):"
               cat "$RUNNER_TEMP/ruleset-error.txt" >&2 2>/dev/null || true
               sleep $((attempt * 3))
               continue
             fi
-            ruleset_id=$(jq -r --arg name "$RULESET_NAME" \
-              '[.[] | select(.name == $name) | .id][0] // empty' <<< "$rulesets")
+            ruleset_id=$(jq -rs --arg name "$RULESET_NAME" \
+              '[add // [] | .[] | select(.name == $name) | .id][0] // empty' <<< "$rulesets")
 
             if [ -z "$ruleset_id" ]; then
               body=$(jq -n --arg name "$RULESET_NAME" --arg ref "$REF" '{
@@ -842,12 +857,12 @@ jobs:
                 lock_ok=true
                 break
               fi
+            elif ! include=$(gh api "repos/$REPO/rulesets/$ruleset_id" --jq '.conditions.ref_name.include' 2>"$RUNNER_TEMP/ruleset-error.txt"); then
+              : # reading the ruleset failed: retried below, like every other call here
+            elif echo "$include" | jq -e --arg ref "$REF" 'index($ref) != null' >/dev/null; then
+              lock_ok=true
+              break
             else
-              include=$(gh api "repos/$REPO/rulesets/$ruleset_id" --jq '.conditions.ref_name.include')
-              if echo "$include" | jq -e --arg ref "$REF" 'index($ref) != null' >/dev/null; then
-                lock_ok=true
-                break
-              fi
               body=$(jq -n --arg name "$RULESET_NAME" --arg ref "$REF" --argjson include "$include" '{
                 name: $name, target: "branch", enforcement: "active",
                 conditions: { ref_name: { include: ($include + [$ref]), exclude: [] } },

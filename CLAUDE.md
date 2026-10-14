@@ -41,11 +41,13 @@ commit messages.
   why in an `::error::` line.
 - **Automerge also waits for every unfinished `pull_request` / `pull_request_target` run of
   the PR head, even one with no check yet** (a run queued on a concurrency group has none,
-  and `gh pr checks` cannot see it). Runs from other events (`push`, `workflow_run`) share
-  the head SHA but are ignored on purpose: they never start automerge again, so waiting on
-  them could hold a PR forever. If the runs can't be listed, it does not merge. So a
-  pull-request workflow that never finishes blocks the merge, and in the event-driven setup
-  every workflow that runs on pull requests must be in the caller's `workflow_run` list.
+  and `gh pr checks` cannot see it). Runs from other events (a `push` or `workflow_dispatch`
+  of the PR branch) can share the head SHA but are ignored on purpose: they never start
+  automerge again, so waiting on them could hold a PR forever. The runs are listed only
+  when the checks alone would allow the merge, and if they can't be listed, it does not
+  merge. So a pull-request workflow that never finishes blocks the merge, and in the
+  event-driven setup every workflow that runs on pull requests must be in the caller's
+  `workflow_run` list.
 - **Runner:** take the label from a `runs_on` input. Don't hardcode `ubuntu-latest`.
 - **Least privilege:** declare `permissions:` explicitly at the top level, and set
   `persist-credentials: false` on checkout unless a later step pushes. A job in a reusable
