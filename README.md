@@ -30,8 +30,9 @@ jobs:
   `extra_instructions`, `hold_on`, `hold_label`.
   **Hold:** when the verdict is in `hold_on` (default `needs changes`; add `minor issues` for a
   stricter repo), the review adds the `hold` label, which the automerge workflow refuses to
-  merge. Callers also trigger on `synchronize`: a push re-runs the review only on a PR the review
-  itself put on hold, and the review lifts that hold once the verdict allows. A `hold` a person
+  merge. Callers trigger on `synchronize` too, so every push is reviewed (automerge waits for that check on
+  the current head), and a passing review lifts a hold the review placed; a review that
+  finishes after a newer push leaves the label to the newer review. A `hold` a person
   added is never removed. To override, remove the label and re-run the automerge job. Never fails
   the check (missing key, API error, timeout), so it never blocks automerge. Authenticates
   with Workload Identity Federation when the caller passes the `anthropic_*` identifiers and
@@ -58,8 +59,7 @@ jobs:
   gitleaks:
     uses: datacrash-io/.github/.github/workflows/reusable-gitleaks.yml@main
   claude-review:
-    # Every PR event: the shared workflow reviews once per PR, and on a push only
-    # re-reviews a PR its own review put on hold.
+    # Every push is reviewed: automerge waits for this check on the current head.
     if: github.event_name == 'pull_request'
     uses: datacrash-io/.github/.github/workflows/reusable-claude-review.yml@main
     secrets: inherit

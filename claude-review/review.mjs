@@ -255,7 +255,12 @@ ${diff}
     warn("Inline comments rejected, posting every finding in the review body", e.message);
     post(bodyWith(review.findings.map(asListItem)), []);
   }
-  if (hold && !before.held) {
+  // A newer push has its own review running: let that one decide the label, so a slow
+  // review of an old commit can neither lift a hold nor add a stale one.
+  const head = JSON.parse(gh(["pr", "view", PR, "--repo", REPO, "--json", "headRefOid"])).headRefOid;
+  if (env.HEAD_SHA && head !== env.HEAD_SHA) {
+    console.log(`PR moved on to ${head.slice(0, 7)} since this review started; leaving the ${HOLD_LABEL} label to its review.`);
+  } else if (hold && !before.held) {
     gh(["api", "--method", "POST", `repos/${REPO}/issues/${PR}/labels`, "--input", "-"], JSON.stringify({ labels: [HOLD_LABEL] }));
     console.log(`Added the ${HOLD_LABEL} label (verdict: ${review.verdict}).`);
   } else if (!hold && before.held && before.byReview) {

@@ -96,35 +96,10 @@ jobs:
     # check, and the automerge workflow would then refuse the PR.
     timeout-minutes: 20
     steps:
-      # Reviews run once per PR (opened / reopened / ready_for_review). A push only
-      # re-runs it on a PR the review itself put on hold, so a fix can lift the hold.
-      - name: Decide whether to review
-        id: gate
-        env:
-          GH_TOKEN: ${{ github.token }}
-          REPO: ${{ github.repository }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
-          ACTION: ${{ github.event.action }}
-          HOLD_LABEL: ${{ inputs.hold_label }}
-        run: |
-          set -euo pipefail
-          run=true
-          if [ "$ACTION" = synchronize ]; then
-            by=$(gh api "repos/$REPO/issues/$PR_NUMBER/events" --paginate \
-              --jq ".[] | select(.event == \"labeled\" and .label.name == \"$HOLD_LABEL\") | .actor.login" | tail -1)
-            has=$(gh api "repos/$REPO/issues/$PR_NUMBER/labels" --jq "[.[].name] | index(\"$HOLD_LABEL\") != null")
-            if [ "$has" = true ] && [ "$by" = "github-actions[bot]" ]; then
-              echo "PR is on hold from an earlier review: reviewing the new push."
-            else
-              run=false
-              echo "Push to a PR not held by the review: nothing to do."
-            fi
-          fi
-          echo "run=$run" >> "$GITHUB_OUTPUT"
-
+      # Runs on every push as well (callers trigger on synchronize): automerge waits for
+      # this check on the current head, so no commit merges unreviewed.
       - name: Choose how to authenticate
         id: key
-        if: steps.gate.outputs.run == 'true'
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           FEDERATION_RULE: ${{ inputs.anthropic_federation_rule_id }}
@@ -189,6 +164,7 @@ jobs:
           EXTRA_INSTRUCTIONS: ${{ inputs.extra_instructions }}
           HOLD_ON: ${{ inputs.hold_on }}
           HOLD_LABEL: ${{ inputs.hold_label }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           AUTH_MODE: ${{ steps.key.outputs.mode }}
           ANTHROPIC_API_KEY: ${{ steps.key.outputs.mode == 'key' && secrets.ANTHROPIC_API_KEY || '' }}
           ANTHROPIC_FEDERATION_RULE_ID: ${{ inputs.anthropic_federation_rule_id }}
