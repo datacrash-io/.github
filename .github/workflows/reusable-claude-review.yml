@@ -8,7 +8,10 @@ name: Reusable - Claude PR Review
 # blocks the automerge workflow (which waits for every other check to finish).
 # A finding is a comment for whoever reads the PR, not a merge gate.
 #
-# Every run calls the Claude API with the ANTHROPIC_API_KEY secret. Callers
+# Auth: Workload Identity Federation when the caller passes the anthropic_*
+# identifiers and grants `id-token: write` (no stored key: the job's GitHub OIDC
+# token is exchanged for a short-lived Anthropic token); otherwise the
+# ANTHROPIC_API_KEY secret. Every run calls the Claude API. Callers
 # trigger it on opened/reopened/ready_for_review rather than every push, and pick
 # the model per repo: claude-sonnet-5-5 where funds, keys or infrastructure are
 # at stake, claude-haiku-5-5 elsewhere.
@@ -36,13 +39,34 @@ on:
         required: false
         type: string
         default: 'datacrash-io-arc'
+      anthropic_federation_rule_id:
+        description: "Workload Identity Federation rule (fdrl_...). With the organization and service account IDs, authenticates through the job's GitHub OIDC token instead of ANTHROPIC_API_KEY. The caller must grant `id-token: write`. These are identifiers, not secrets; keep them in the (private) caller, not here."
+        required: false
+        type: string
+        default: ''
+      anthropic_organization_id:
+        description: "Anthropic organization UUID, for Workload Identity Federation."
+        required: false
+        type: string
+        default: ''
+      anthropic_service_account_id:
+        description: "Service account (svac_...) the federated token acts as."
+        required: false
+        type: string
+        default: ''
+      anthropic_workspace_id:
+        description: "Workspace (wrkspc_...). Only needed when the federation rule spans several workspaces."
+        required: false
+        type: string
+        default: ''
     secrets:
       ANTHROPIC_API_KEY:
         required: false
 
-permissions:
-  contents: read
-  pull-requests: write
+# No `permissions:` here on purpose: the job inherits the caller's. Requesting
+# `id-token: write` here would make every caller that does not grant it fail to
+# start (a red check that blocks automerge). Callers grant contents: read and
+# pull-requests: write, plus id-token: write to use federation.
 
 jobs:
   review:
@@ -55,17 +79,25 @@ jobs:
     # check, and the automerge workflow would then refuse the PR.
     timeout-minutes: 20
     steps:
-      - name: Check API key
+      - name: Choose how to authenticate
         id: key
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          FEDERATION_RULE: ${{ inputs.anthropic_federation_rule_id }}
         run: |
-          if [ -z "$ANTHROPIC_API_KEY" ]; then
-            echo "::notice::ANTHROPIC_API_KEY is not set for this repo -- skipping the Claude review."
-            echo "present=false" >> "$GITHUB_OUTPUT"
-          else
-            echo "present=true" >> "$GITHUB_OUTPUT"
+          mode=none
+          if [ -n "$FEDERATION_RULE" ] && [ -n "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ]; then
+            mode=federation
+          elif [ -n "$ANTHROPIC_API_KEY" ]; then
+            mode=key
+            [ -n "$FEDERATION_RULE" ] && echo "::warning::Federation IDs given but the caller does not grant id-token: write -- using ANTHROPIC_API_KEY."
           fi
+          case "$mode" in
+            none) echo "::notice::No federation and no ANTHROPIC_API_KEY for this repo -- skipping the Claude review." ;;
+            *) echo "Authenticating with: $mode" ;;
+          esac
+          echo "mode=$mode" >> "$GITHUB_OUTPUT"
+          echo "present=$([ "$mode" = none ] && echo false || echo true)" >> "$GITHUB_OUTPUT"
 
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         if: steps.key.outputs.present == 'true'
@@ -82,7 +114,11 @@ jobs:
         timeout-minutes: 15
         uses: anthropics/claude-code-action@1d6de8cb0c237e7c15e9e1bdf973826ebae490cc # v1.0.248
         with:
-          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          anthropic_api_key: ${{ steps.key.outputs.mode == 'key' && secrets.ANTHROPIC_API_KEY || '' }}
+          anthropic_federation_rule_id: ${{ steps.key.outputs.mode == 'federation' && inputs.anthropic_federation_rule_id || '' }}
+          anthropic_organization_id: ${{ steps.key.outputs.mode == 'federation' && inputs.anthropic_organization_id || '' }}
+          anthropic_service_account_id: ${{ steps.key.outputs.mode == 'federation' && inputs.anthropic_service_account_id || '' }}
+          anthropic_workspace_id: ${{ steps.key.outputs.mode == 'federation' && inputs.anthropic_workspace_id || '' }}
           github_token: ${{ github.token }}
           prompt: |
             REPO: ${{ github.repository }}

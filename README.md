@@ -24,8 +24,10 @@ jobs:
   because GitHub's own secret scanning needs Advanced Security on private repos.
 - `.github/workflows/reusable-claude-review.yml`: advisory PR review by Claude Code
   (`anthropics/claude-code-action`), inline comments plus one summary comment. Never fails
-  the check (missing key, API error, timeout), so it never blocks automerge. Needs the
-  secret `ANTHROPIC_API_KEY`; skipped with a notice without it. Skips drafts and bot PRs.
+  the check (missing key, API error, timeout), so it never blocks automerge. Authenticates
+  with Workload Identity Federation when the caller passes the `anthropic_*` identifiers and
+  grants `id-token: write` (no stored key), otherwise with the `ANTHROPIC_API_KEY` secret;
+  skipped with a notice when it has neither. Skips drafts and bot PRs.
 
 Caller for both (`.github/workflows/security-review.yml`). Trigger the review only on
 `opened`/`reopened`/`ready_for_review`, not `synchronize`, so a PR is reviewed once rather
@@ -42,6 +44,7 @@ on:
 permissions:
   contents: read
   pull-requests: write
+  id-token: write  # federation only
 jobs:
   gitleaks:
     uses: datacrash-io/.github/.github/workflows/reusable-gitleaks.yml@main
@@ -51,4 +54,8 @@ jobs:
     secrets: inherit
     with:
       model: claude-haiku-5-5
+      # Identifiers, not secrets. Keep them in the private caller, not in this repo.
+      anthropic_federation_rule_id: fdrl_...
+      anthropic_organization_id: <organization uuid>
+      anthropic_service_account_id: svac_...
 ```
