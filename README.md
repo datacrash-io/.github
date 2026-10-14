@@ -26,7 +26,7 @@ jobs:
   `claude-review/review.mjs` on the Claude Agent SDK: one review with inline comments. Not
   `anthropics/claude-code-action`, because that runs Claude Code, which API credits granted with
   a Claude plan don't cover. The agent reads the repo but has no shell and no GitHub token; the
-  script posts its findings. Inputs: `model`, `max_turns`, `max_budget_usd` (default 1),
+  script posts its findings. Inputs: `model` (empty = claude-sonnet-5-5; callers pass `vars.CLAUDE_REVIEW_MODEL`), `max_turns`, `max_budget_usd` (default 1),
   `extra_instructions`, `hold_on`, `hold_label`.
   **Hold:** when the verdict is in `hold_on` (default `needs changes`; add `minor issues` for a
   stricter repo), the review adds the `hold` label, which the automerge workflow refuses to
@@ -77,7 +77,9 @@ jobs:
       id-token: write
     uses: datacrash-io/.github/.github/workflows/reusable-claude-review.yml@main
     with:
-      model: claude-haiku-5-5
+      # Empty = the shared default (claude-sonnet-5-5). Switch one repo without a PR:
+      #   gh variable set CLAUDE_REVIEW_MODEL -R datacrash-io/<repo> -b claude-haiku-5-5
+      model: ${{ vars.CLAUDE_REVIEW_MODEL }}
       hold_on: 'needs changes,minor issues'
       # Identifiers, not secrets. Keep them in the private caller, not in this repo.
       anthropic_federation_rule_id: fdrl_...

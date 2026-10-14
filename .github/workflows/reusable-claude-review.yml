@@ -17,17 +17,17 @@ name: Reusable - Claude PR Review
 # identifiers and grants `id-token: write` (no stored key: the job's GitHub OIDC
 # token is exchanged for a short-lived Anthropic token); otherwise the
 # ANTHROPIC_API_KEY secret. Every run calls the Claude API (well under a cent on
-# Haiku). Callers pick the model per repo: claude-sonnet-5-5 where funds, keys or infrastructure are
-# at stake, claude-haiku-5-5 elsewhere.
+# Haiku). The model defaults to claude-sonnet-5-5; a repo overrides it with
+# its CLAUDE_REVIEW_MODEL variable (see the model input).
 
 on:
   workflow_call:
     inputs:
       model:
-        description: "Claude model ID, e.g. claude-haiku-5-5 or claude-sonnet-5-5."
+        description: "Claude model ID. Empty means this workflow's default (claude-sonnet-5-5). Callers pass their repository variable CLAUDE_REVIEW_MODEL here, so one repo can switch models with `gh variable set` and no PR; changing the default here switches every repo that leaves it unset."
         required: false
         type: string
-        default: 'claude-haiku-5-5'
+        default: ''
       max_turns:
         description: "Cap on agent turns per review."
         required: false
@@ -191,7 +191,7 @@ jobs:
         env:
           REPO: ${{ github.repository }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
-          MODEL: ${{ inputs.model }}
+          MODEL: ${{ inputs.model || 'claude-sonnet-5-5' }}
           MAX_TURNS: ${{ inputs.max_turns }}
           MAX_BUDGET_USD: ${{ inputs.max_budget_usd }}
           EXTRA_INSTRUCTIONS: ${{ inputs.extra_instructions }}
