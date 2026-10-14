@@ -33,7 +33,9 @@ jobs:
   merge. Callers trigger on `synchronize` too, so every push is reviewed (automerge waits for that check on
   the current head), and a passing review lifts a hold the review placed; a review that
   finishes after a newer push leaves the label to the newer review. A `hold` a person
-  added is never removed. To override, remove the label and re-run the automerge job. Never fails
+  added is never removed. **Threads:** each run re-checks the review's own open inline
+  threads against the current code, resolves the fixed ones with a reply naming the commit,
+  and keeps still-valid ones open without re-posting them. A person's threads are never touched. To override, remove the label and re-run the automerge job. Never fails
   the check (missing key, API error, timeout), so it never blocks automerge. Authenticates
   with Workload Identity Federation when the caller passes the `anthropic_*` identifiers and
   grants `id-token: write` (no stored key), otherwise with the `ANTHROPIC_API_KEY` secret;
