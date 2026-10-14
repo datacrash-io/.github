@@ -27,7 +27,12 @@ jobs:
   `anthropics/claude-code-action`, because that runs Claude Code, which API credits granted with
   a Claude plan don't cover. The agent reads the repo but has no shell and no GitHub token; the
   script posts its findings. Inputs: `model`, `max_turns`, `max_budget_usd` (default 1),
-  `extra_instructions`. Never fails
+  `extra_instructions`, `hold_on`, `hold_label`.
+  **Hold:** when the verdict is in `hold_on` (default `needs changes`; add `minor issues` for a
+  stricter repo), the review adds the `hold` label, which the automerge workflow refuses to
+  merge. Callers also trigger on `synchronize`: a push re-runs the review only on a PR the review
+  itself put on hold, and the review lifts that hold once the verdict allows. A `hold` a person
+  added is never removed. To override, remove the label and re-run the automerge job. Never fails
   the check (missing key, API error, timeout), so it never blocks automerge. Authenticates
   with Workload Identity Federation when the caller passes the `anthropic_*` identifiers and
   grants `id-token: write` (no stored key), otherwise with the `ANTHROPIC_API_KEY` secret;
@@ -53,7 +58,9 @@ jobs:
   gitleaks:
     uses: datacrash-io/.github/.github/workflows/reusable-gitleaks.yml@main
   claude-review:
-    if: github.event_name == 'pull_request' && github.event.action != 'synchronize'
+    # Every PR event: the shared workflow reviews once per PR, and on a push only
+    # re-reviews a PR its own review put on hold.
+    if: github.event_name == 'pull_request'
     uses: datacrash-io/.github/.github/workflows/reusable-claude-review.yml@main
     secrets: inherit
     with:

@@ -31,6 +31,16 @@ on:
         required: false
         type: number
         default: 25
+      hold_on:
+        description: "Comma-separated verdicts that make the review add the hold label, which the shared automerge workflow refuses to merge: 'needs changes' (default), add 'minor issues' for a stricter repo, or '' to never hold."
+        required: false
+        type: string
+        default: 'needs changes'
+      hold_label:
+        description: "Label the review adds to hold a PR; must match the automerge workflow's hold_label."
+        required: false
+        type: string
+        default: 'hold'
       max_budget_usd:
         description: "Stop a review once its estimated cost reaches this many USD."
         required: false
@@ -86,8 +96,35 @@ jobs:
     # check, and the automerge workflow would then refuse the PR.
     timeout-minutes: 20
     steps:
+      # Reviews run once per PR (opened / reopened / ready_for_review). A push only
+      # re-runs it on a PR the review itself put on hold, so a fix can lift the hold.
+      - name: Decide whether to review
+        id: gate
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          ACTION: ${{ github.event.action }}
+          HOLD_LABEL: ${{ inputs.hold_label }}
+        run: |
+          set -euo pipefail
+          run=true
+          if [ "$ACTION" = synchronize ]; then
+            by=$(gh api "repos/$REPO/issues/$PR_NUMBER/events" --paginate \
+              --jq ".[] | select(.event == \"labeled\" and .label.name == \"$HOLD_LABEL\") | .actor.login" | tail -1)
+            has=$(gh api "repos/$REPO/issues/$PR_NUMBER/labels" --jq "[.[].name] | index(\"$HOLD_LABEL\") != null")
+            if [ "$has" = true ] && [ "$by" = "github-actions[bot]" ]; then
+              echo "PR is on hold from an earlier review: reviewing the new push."
+            else
+              run=false
+              echo "Push to a PR not held by the review: nothing to do."
+            fi
+          fi
+          echo "run=$run" >> "$GITHUB_OUTPUT"
+
       - name: Choose how to authenticate
         id: key
+        if: steps.gate.outputs.run == 'true'
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           FEDERATION_RULE: ${{ inputs.anthropic_federation_rule_id }}
@@ -150,6 +187,8 @@ jobs:
           MAX_TURNS: ${{ inputs.max_turns }}
           MAX_BUDGET_USD: ${{ inputs.max_budget_usd }}
           EXTRA_INSTRUCTIONS: ${{ inputs.extra_instructions }}
+          HOLD_ON: ${{ inputs.hold_on }}
+          HOLD_LABEL: ${{ inputs.hold_label }}
           AUTH_MODE: ${{ steps.key.outputs.mode }}
           ANTHROPIC_API_KEY: ${{ steps.key.outputs.mode == 'key' && secrets.ANTHROPIC_API_KEY || '' }}
           ANTHROPIC_FEDERATION_RULE_ID: ${{ inputs.anthropic_federation_rule_id }}
