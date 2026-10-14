@@ -41,11 +41,6 @@ on:
         required: false
         type: string
         default: ''
-      reviewer_ref:
-        description: "Ref of this repo to take claude-review/ from. Only for testing a branch; callers leave it at main."
-        required: false
-        type: string
-        default: 'main'
       runs_on:
         description: "Runner label for the job."
         required: false
@@ -117,13 +112,14 @@ jobs:
           fetch-depth: 1
           persist-credentials: false
 
-      # The reviewer script and its lockfile, from this repo (main unless a test sets
-      # reviewer_ref), moved out of the workspace the agent can read.
+      # The reviewer script and its lockfile, always from this repo's main: the same ref
+      # the federation rule trusts this workflow at, so a caller can't make the job run
+      # other code with that token. Moved out of the workspace the agent can read.
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         if: steps.key.outputs.present == 'true'
         with:
           repository: datacrash-io/.github
-          ref: ${{ inputs.reviewer_ref }}
+          ref: main
           path: .claude-review-tool
           sparse-checkout: claude-review
           persist-credentials: false
