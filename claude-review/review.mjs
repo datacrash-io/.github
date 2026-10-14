@@ -33,6 +33,9 @@ const BOT = "github-actions[bot]";
 // Every credential the job holds. The agent's output is checked against these before
 // anything is posted.
 const secretValues = new Set([env.ANTHROPIC_API_KEY, env.GH_TOKEN, env.ACTIONS_ID_TOKEN_REQUEST_TOKEN].filter((v) => v && v.length >= 8));
+// A credential can be quoted encoded as well as verbatim.
+const encodings = (v) => [v, Buffer.from(v).toString("base64").replace(/=+$/, ""), Buffer.from(v).toString("base64url"), Buffer.from(v).toString("hex")];
+const leaksSecret = (text) => [...secretValues].some((v) => encodings(v).some((e) => text.includes(e)));
 
 const warn = (title, msg) => console.log(`::warning title=${title}::${String(msg).replace(/\r?\n/g, " ").slice(0, 900)}`);
 
@@ -201,6 +204,13 @@ async function main() {
   const truncated = diff.length > MAX_DIFF_CHARS;
   if (truncated) diff = diff.slice(0, MAX_DIFF_CHARS);
 
+  // A PR can add a symlink (e.g. to /proc/self/environ) whose in-repo path matches the
+  // Read(./**) allow rule, so the realpath check in canUseTool would never run. The
+  // checkout is only read and never committed: drop every symlink outside .git first.
+  // (-not -path, not -prune: -delete implies -depth, which disables -prune.)
+  const links = execFileSync("find", [WORKSPACE, "-type", "l", "-not", "-path", join(WORKSPACE, ".git", "*"), "-print", "-delete"], { encoding: "utf8" }).trim();
+  if (links) console.log(`Removed ${links.split("\n").length} symlink(s) from the checkout before the review.`);
+
   const work = join(env.RUNNER_TEMP || "/tmp", "claude-review-auth");
   rmSync(work, { recursive: true, force: true });
   mkdirSync(work, { recursive: true, mode: 0o700 });
@@ -302,7 +312,7 @@ ${diff}
   const review = result.structured_output;
   // Last line of defence against a prompt-injected PR getting a credential posted.
   const text = JSON.stringify(review);
-  if ([...secretValues].some((v) => text.includes(v))) {
+  if (leaksSecret(text)) {
     warn("Claude review not posted", "the review text contained one of the job's credentials; nothing was posted.");
     return;
   }
