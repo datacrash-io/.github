@@ -89,7 +89,8 @@ on:
           A PR carrying this label is never merged by this workflow. It is read
           right before merging, once every other check has finished, so a label
           added while checks run still stops the merge, and a hold that the Claude
-          review of the same push lifts doesn't stop it. Use it where a PR must stay open: plans without draft
+          review of the same push lifts doesn't stop it. If the labels cannot be
+          read, the PR is not merged that time. Use it where a PR must stay open: plans without draft
           pull requests have no other way to say "not yet". Removing the label does
           not re-trigger this workflow on its own unless the caller listens to
           `unlabeled`; otherwise re-run the job or push to the PR.
@@ -256,13 +257,47 @@ jobs:
           base_merge_args=(--"$MERGE_STRATEGY" --delete-branch)
           merge_args=("${base_merge_args[@]}")
 
+          # Prints the output of a read-only gh call, tried up to 3 times 5 s apart. One
+          # that keeps failing leaves its last error in $RUNNER_TEMP/read-error.txt.
+          gh_read() {
+            local try
+            for try in 1 2 3; do
+              if gh "$@" 2> "$RUNNER_TEMP/read-error.txt"; then
+                return 0
+              fi
+              if [ "$try" -lt 3 ]; then
+                sleep 5
+              fi
+            done
+            return 1
+          }
+
+          # A read that keeps failing means "cannot verify": this attempt does not merge,
+          # and the step does not fail either, since a failed step moves the PR back to
+          # draft, and the cause is usually a transient API error, not the PR. When not
+          # waiting it exits 0; when waiting it returns after the poll interval, and the
+          # caller goes on to the next poll.
+          cannot_verify() { # <what could not be read> <file holding the error>
+            local error
+            error=$(tail -n 1 "$2" 2> /dev/null | cut -c 1-300 || true)
+            echo "attempt=$attempt $1 unknown (${error:-no error output})"
+            if [ "$WAIT_FOR_PENDING" != "true" ]; then
+              echo "::warning::Could not read $1 of PR #$PR_NUMBER -- not merging this time. The next workflow to finish runs this again; if none is left, re-run this job."
+              exit 0
+            fi
+            sleep 15
+          }
+
           for attempt in $(seq 1 120); do
             # The hold label is read only once every check has finished (below), not here:
             # a fix push starts this run while the previous review's hold is still on the
             # PR, and that push's Claude review lifts it only when its own check finishes.
             # Exiting on the stale label now would miss the lift, and a lift done with
             # GITHUB_TOKEN starts no workflow that could merge later.
-            view=$(gh pr view "$PR_NUMBER" --repo "$REPO" --json state)
+            if ! view=$(gh_read pr view "$PR_NUMBER" --repo "$REPO" --json state,headRefOid); then
+              cannot_verify "the state" "$RUNNER_TEMP/read-error.txt"
+              continue
+            fi
             state=$(jq -r .state <<<"$view")
             if [ "$state" = "MERGED" ]; then
               echo "PR was already merged outside this run -- automerge has nothing left to do."
@@ -276,12 +311,12 @@ jobs:
 
             # Always pin the merge to the head these checks belong to: a push landing
             # in between makes GitHub refuse it, and that push's own run takes over.
-            polled_head=$(gh pr view "$PR_NUMBER" --repo "$REPO" --json headRefOid --jq .headRefOid)
+            polled_head=$(jq -r '.headRefOid // empty' <<<"$view")
             # This run answers only for its own head (its event's, which Resolve checked).
             # Runs for different heads no longer queue one behind the other (see the job's
             # concurrency group), so one that followed a newer head would race that head's
-            # own run to the same merge, and `gh pr merge` of a PR merged a moment earlier
-            # exits 0, so both would dispatch the post-merge workflows.
+            # own run to the same merge, and both could dispatch the post-merge workflows
+            # (see the merge call below).
             if [ -n "$polled_head" ] && [ "$polled_head" != "$HEAD_SHA" ]; then
               echo "::notice::PR #$PR_NUMBER has moved on from $HEAD_SHA to $polled_head -- leaving the merge to that head's own run."
               exit 0
@@ -309,13 +344,7 @@ jobs:
               fi
             done
             if [ "$checks_ok" != "true" ]; then
-              checks_error=$(tail -n 1 "$RUNNER_TEMP/checks-error.txt" 2> /dev/null | cut -c 1-300 || true)
-              echo "attempt=$attempt checks unknown (${checks_error:-no error output})"
-              if [ "$WAIT_FOR_PENDING" != "true" ]; then
-                echo "::warning::Could not read the checks of PR #$PR_NUMBER -- not merging this time. The next workflow to finish runs this again; if none is left, re-run this job."
-                exit 0
-              fi
-              sleep 15
+              cannot_verify "the checks" "$RUNNER_TEMP/checks-error.txt"
               continue
             fi
             others=$(echo "$rows" | jq -c --arg wf "$SELF_WORKFLOW" '[.[] | select(.workflow != $wf)]')
@@ -397,7 +426,14 @@ jobs:
             fi
 
             if { [ "$total" -gt 0 ] && [ "$pending" -eq 0 ]; } || { [ "$no_checks_ever_coming" = "true" ] && [ "$ALLOW_NO_CHECKS" = "true" ]; }; then
-              if gh pr view "$PR_NUMBER" --repo "$REPO" --json labels --jq '.labels[].name' | grep -qxF "$HOLD_LABEL"; then
+              # Read into a variable first: in a pipeline into grep, a failed read looked
+              # like "no hold label" and merged. A read that keeps failing cannot rule the
+              # hold out, so it never merges.
+              if ! labels=$(gh_read pr view "$PR_NUMBER" --repo "$REPO" --json labels --jq '.labels[].name'); then
+                cannot_verify "the labels" "$RUNNER_TEMP/read-error.txt"
+                continue
+              fi
+              if grep -qxF "$HOLD_LABEL" <<< "$labels"; then
                 echo "::notice::PR #$PR_NUMBER has the '$HOLD_LABEL' label -- not merging. A fix push re-runs this after its review; removing the label re-runs it too."
                 echo "### Not merged: PR #$PR_NUMBER is on \`$HOLD_LABEL\`" >> "$GITHUB_STEP_SUMMARY"
                 exit 0
@@ -408,6 +444,14 @@ jobs:
                 echo "All checks passed. Merging."
               fi
               if gh pr merge "${merge_args[@]}" "$PR_NUMBER" --repo "$REPO" 2> "$RUNNER_TEMP/merge-error.txt"; then
+                # gh also exits 0 when the PR was merged after its last read here: it skips
+                # the merge and warns "Pull request <repo>#<n> was already merged". Then a
+                # person or another run merged it, and that run dispatches the post-merge
+                # workflows itself, so this one must not dispatch them a second time.
+                if grep -qE "Pull request [^ ]+#$PR_NUMBER was already merged" "$RUNNER_TEMP/merge-error.txt"; then
+                  echo "::notice::PR #$PR_NUMBER was merged a moment before this run's merge call, not by it -- not dispatching post-merge workflows."
+                  exit 0
+                fi
                 echo "merged_by_this_run=true" >> "$GITHUB_OUTPUT"
                 exit 0
               fi
