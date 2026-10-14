@@ -5,15 +5,35 @@ Shared GitHub Actions workflows for datacrash-io repositories.
 ## Workflows
 
 - `.github/workflows/reusable-automerge-ready-prs.yml`: merges a pull request once it is
-  ready for review and every other check on its head commit has passed. Inputs and optional
-  secrets are documented in the file.
+  ready for review, every other check on its head commit has passed, and every other
+  `pull_request` workflow run of that commit has completed. The last part catches a run
+  queued on a concurrency group, which has no check yet. Inputs and optional secrets are
+  documented in the file. The recommended setup is event-driven: with
+  `wait_for_pending_checks: false` the job checks once and exits, and a `workflow_run`
+  trigger listing every other workflow that runs on pull requests starts it again when one
+  of them finishes, so no job holds a runner while checks run. The input still defaults to
+  `true` (poll and wait) while callers are moved over.
 
 ```yaml
+on:
+  pull_request:
+    types: [opened, reopened, ready_for_review, synchronize, unlabeled]
+  workflow_run:
+    # By name: every other workflow that runs on this repository's pull requests.
+    workflows: [CI, Security & Review]
+    types: [completed]
+permissions:
+  contents: write
+  pull-requests: write
+  checks: read
+  statuses: read
+  actions: write
 jobs:
   automerge:
     uses: datacrash-io/.github/.github/workflows/reusable-automerge-ready-prs.yml@main
     with:
       merge_strategy: merge
+      wait_for_pending_checks: false
 ```
 
 - `.github/workflows/reusable-gitleaks.yml`: secret scanning with
