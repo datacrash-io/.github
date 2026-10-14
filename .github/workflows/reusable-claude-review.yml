@@ -161,7 +161,10 @@ jobs:
           set -euo pipefail
           mv .claude-review-tool/claude-review "$RUNNER_TEMP/claude-review"
           # Context for the agent, inside the workspace it may read; never committed.
-          mkdir -p .datacrash-shared
+          # Includes the reviewer script itself, so claims about hold, thread or
+          # permission handling can be checked against its code.
+          mkdir -p .datacrash-shared/claude-review
+          cp "$RUNNER_TEMP/claude-review/review.mjs" .datacrash-shared/claude-review/
           mv .claude-review-tool/.github/workflows .datacrash-shared/workflows
           mv .claude-review-tool/CLAUDE.md .claude-review-tool/README.md .datacrash-shared/
           rm -rf .claude-review-tool
