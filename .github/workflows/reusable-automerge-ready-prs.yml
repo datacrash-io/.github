@@ -32,7 +32,7 @@ on:
         type: string
         default: '["Security & Review"]'
       post_merge_workflows:
-        description: "Space-separated workflow filenames to `gh workflow run --ref <default-branch>` after a successful merge (e.g. 'release.yml deploy.yml'), in this order. Needed because a merge commit pushed by GITHUB_TOKEN never triggers push-based workflows (GitHub's anti-recursion rule). Each is dispatched only if a push of the merge would have started it (its on.push branches/paths filters, read at the merge commit); one without a push path filter always is. Empty = skip, for repos with nothing to re-trigger."
+        description: "Space-separated workflow filenames to `gh workflow run --ref <default-branch>` after a successful merge (e.g. 'release.yml deploy.yml'), in this order. Needed because a merge commit pushed by GITHUB_TOKEN never triggers push-based workflows (GitHub's anti-recursion rule). Each is dispatched only if a push of the merge would have started it (its on.push branches/paths filters, read at the merge commit); one without a push path filter always is. One with a top-level concurrency group is dispatched at once; one without waits up to 10 minutes for its in-flight runs first, so two of its runs never overlap. Empty = skip, for repos with nothing to re-trigger."
         required: false
         type: string
         default: ''
@@ -707,10 +707,12 @@ jobs:
           filter_error=""
           # shellcheck disable=SC2086
           if python3 - "$REPO" "$PR_NUMBER" "$DEFAULT_BRANCH" $WORKFLOWS > "$decisions" 2> "$filter_log" <<'PY'
-          # Prints one line per listed workflow, "<dispatch|skip>\t<file>\t<reason>". The
-          # bash around this dispatches a workflow unless it reads a well-formed skip line
+          # Prints one line per listed workflow, "<dispatch|skip>\t<file>\t<queue|wait>\t<reason>".
+          # The bash around this dispatches a workflow unless it reads a well-formed skip line
           # for it, and dispatches every one of them if this exits non-zero -- so an
-          # error anywhere in here costs an extra run, never a missed deploy.
+          # error anywhere in here costs an extra run, never a missed deploy. "queue" means
+          # the workflow serializes its own runs (see serializes_runs), so it is dispatched
+          # at once; anything else waits for its in-flight runs first.
           import json
           import re
           import subprocess
@@ -898,6 +900,25 @@ jobs:
               except FilterError as e:
                   return DISPATCH, f"cannot evaluate its push filter: {e}"
 
+          def serializes_runs(workflow_text):
+              """Does a top-level concurrency group make GitHub run one dispatch of the default
+              branch at a time? Then a new dispatch can go straight in: GitHub queues it behind the
+              running one, and a newer pending run replaces an older pending one, which is
+              harmless because each dispatch builds the branch head at dispatch time, so the
+              newer run contains the older one's merge. A job-level group is not enough: two
+              runs' other jobs overlap, and the older one's deploy can queue behind the newer
+              one's and roll production back. Any doubt answers False (wait, as before)."""
+              try:
+                  doc = yaml.safe_load(workflow_text)
+              except yaml.YAMLError:
+                  return False
+              concurrency = doc.get("concurrency") if isinstance(doc, dict) else None
+              group = concurrency.get("group") if isinstance(concurrency, dict) else concurrency
+              if not isinstance(group, str) or not group.strip():
+                  return False
+              # A group keyed on the run or commit is a group per run: nothing serializes.
+              return not re.search(r"github\.(run_id|run_number|run_attempt|sha)\b", group)
+
           def gh(*args):
               """`gh <args>` with a few retries; raises FilterError when it keeps failing."""
               error = ""
@@ -957,6 +978,7 @@ jobs:
               sha, paths = changed_paths(repo, pr_number)
               lines = []
               for wf in workflows:
+                  queue = "wait"
                   try:
                       if not re.fullmatch(r"[A-Za-z0-9._-]+", wf):
                           raise FilterError("not a plain workflow file name")
@@ -964,10 +986,11 @@ jobs:
                       path = urllib.parse.quote(f".github/workflows/{wf}")
                       text = gh("api", "-H", "Accept: application/vnd.github.raw+json", f"repos/{repo}/contents/{path}?ref={sha}")
                       decision, reason = decide(text, branch, paths)
+                      queue = "queue" if serializes_runs(text) else "wait"
                   except Exception as e:  # noqa: BLE001 -- any failure here means dispatch
                       decision, reason = DISPATCH, f"{type(e).__name__}: {e}"
                   reason = re.sub(r"\s+", " ", reason).strip()[:300] or "no reason given"
-                  lines.append(f"{decision}\t{wf}\t{reason}")
+                  lines.append(f"{decision}\t{wf}\t{queue}\t{reason}")
               print("\n".join(lines))
 
           if __name__ == "__main__":
@@ -987,26 +1010,34 @@ jobs:
           sed 's/^/filter: /' "$filter_log" || true
 
           selected=""
+          queued=" "
           table=""
           for wf in $WORKFLOWS; do
             kind=dispatch
+            queue="wait"
             reason="path filter failed: $filter_error"
             if [ "$filter_ran" = "true" ]; then
               line=$(awk -F '\t' -v wf="$wf" '$2 == wf { print; exit }' "$decisions" || true)
-              got_kind="" got_wf="" got_reason=""
-              IFS=$'\t' read -r got_kind got_wf got_reason <<< "$line" || true
+              got_kind="" got_wf="" got_queue="" got_reason=""
+              IFS=$'\t' read -r got_kind got_wf got_queue got_reason <<< "$line" || true
               if [ "$got_wf" = "$wf" ] && [ -n "$got_reason" ] && { [ "$got_kind" = "skip" ] || [ "$got_kind" = "dispatch" ]; }; then
                 kind=$got_kind
                 reason=$got_reason
+                if [ "$got_queue" = "queue" ]; then
+                  queue="queue"
+                fi
               else
                 reason="the path filter gave no decision for it"
               fi
             fi
-            echo "$kind $wf: $reason"
+            echo "$kind $wf ($queue): $reason"
             if [ "$kind" != "skip" ]; then
               selected="$selected $wf"
+              if [ "$queue" = "queue" ]; then
+                queued="$queued$wf "
+              fi
             fi
-            table="$table| \`$wf\` | $kind | ${reason//|/\\|} |"$'\n'
+            table="$table| \`$wf\` | $kind | $queue | ${reason//|/\\|} |"$'\n'
           done
 
           {
@@ -1018,8 +1049,8 @@ jobs:
               echo "**The path filter failed, so every listed workflow was dispatched:** $filter_error"
             fi
             echo
-            echo "| Workflow | Decision | Why |"
-            echo "|---|---|---|"
+            echo "| Workflow | Decision | In-flight runs | Why |"
+            echo "|---|---|---|---|"
             printf '%s' "$table"
           } >> "${GITHUB_STEP_SUMMARY:-/dev/null}" || echo "::warning::Could not write the step summary."
 
@@ -1029,10 +1060,21 @@ jobs:
           for wf in $selected; do echo "$wf"; done > "$RUNNER_TEMP/post-merge-selected.txt"
           : > "$RUNNER_TEMP/post-merge-dispatched.txt"
 
+          # "queue": the workflow has a top-level concurrency group, so GitHub serializes its
+          # runs and a newer pending dispatch (a newer default-branch head, which contains this
+          # merge) replaces an older one; it is dispatched at once instead of holding this
+          # runner while an earlier run deploys. "wait": no such group, so two dispatches
+          # could run side by side (two releases racing for one tag, or an older deploy
+          # finishing after a newer one); wait for its in-flight runs first.
           WAIT_ATTEMPTS=40 # 40 * 15s = 10 minutes per workflow before giving up
 
           for wf in $selected; do
-            for attempt in $(seq 1 "$WAIT_ATTEMPTS"); do
+            waits=$WAIT_ATTEMPTS
+            if [[ "$queued" == *" $wf "* ]]; then
+              echo "$wf: serializes its own runs, dispatching without waiting for in-flight ones"
+              waits=0
+            fi
+            for ((attempt = 1; attempt <= waits; attempt++)); do
               in_flight=$(gh run list --repo "$REPO" --workflow "$wf" --json status \
                 --jq '[.[] | select(.status == "in_progress" or .status == "queued")] | length')
               if [ "$in_flight" -eq 0 ]; then
