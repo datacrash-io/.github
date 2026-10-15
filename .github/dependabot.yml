@@ -1,0 +1,41 @@
+# Dependabot version updates for the actions the shared workflows pin.
+#
+# Every caller runs these workflows @main, so the action SHAs pinned here run in every
+# datacrash-io repository on every pull request and push. Until this file existed nothing kept
+# them current: on 2026-10-14 the gitleaks and Claude review workflows still pinned
+# actions/checkout v6.1.0 while the org's other repositories had moved to v7.0.1.
+#
+# Weekly, one grouped PR, majors by hand (the same shape as the org's other repositories):
+# - cooldown 7 days: a release younger than a week is not proposed yet.
+# - semver-major version updates are ignored: a major is read and tested before it ships to
+#   every caller at once. Security updates (a repository setting, not this file) still get a
+#   major when the fix needs one.
+# - The minor-patch group has no update-types filter on purpose: a SHA-pinned action is
+#   neither minor nor patch, and would otherwise get a PR of its own.
+#
+# Nothing here is merged automatically: this repository has no automerge workflow, and the
+# shared automerge never acts on a run Dependabot started. Review and merge by hand, keeping in
+# mind that the merge reaches every caller at once.
+#
+# Not listed: claude-review/'s npm package. Its Agent SDK is pinned on purpose with a lockfile;
+# a bump changes the reviewer in every repository on merge, so it is done by hand.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    schedule: {interval: weekly, day: monday, time: "05:00"} # UTC
+    open-pull-requests-limit: 1 # version PRs only; security PRs are not capped
+    directory: "/"
+    cooldown:
+      default-days: 7
+    ignore:
+      # Majors are done by hand: see above.
+      - dependency-name: "*"
+        update-types: ["version-update:semver-major"]
+    labels: [dependencies, github_actions]
+    groups:
+      actions-security:
+        applies-to: security-updates
+        patterns: ["*"]
+      actions-minor-patch:
+        applies-to: version-updates
+        patterns: ["*"]

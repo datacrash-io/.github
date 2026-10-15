@@ -13,6 +13,7 @@ workflow (`on: workflow_call`) that the org's repositories call with
 | `.github/workflows/reusable-claude-review.yml` | PR review, run by `claude-review/review.mjs` on the Claude Agent SDK. Never fails the check. On a verdict in `hold_on` it adds the `hold` label, which stops automerge, and it lifts its own hold after a passing re-review. Reviews every push, and resolves its own earlier threads once the code fixes them. |
 | `claude-review/` | The reviewer script plus a pinned SDK and lockfile. The workflow checks it out from `main` at run time, so a change here reaches every repo on merge. |
 | `README.md` | One entry per workflow plus a caller example. |
+| `.github/dependabot.yml` | Weekly grouped PR bumping the actions pinned in the workflows above (majors by hand). Never merged automatically. |
 
 ## This repository is public
 
@@ -56,8 +57,10 @@ commit messages.
   request it here; until then, let the job inherit (as `resolve-threads` does with
   `contents: write`) and degrade quietly.
 - **Pin third-party actions to a full commit SHA** with the version as a comment
-  (`uses: owner/action@<sha> # v1.2.3`). Downloaded binaries need a pinned version and a
-  checksum check.
+  (`uses: owner/action@<sha> # v1.2.3`), and prefer the SHA the org's other repositories
+  already run. Dependabot proposes the bumps weekly; review each one as a change to every
+  caller, since it ships to all of them on merge. Downloaded binaries need a pinned version
+  and a checksum check.
 - **Untrusted input** (PR title, body, branch name, commit messages, comments) only goes into
   `run:` through `env:` and a quoted variable, never inline as `${{ ... }}`. A prompt given
   to a model treats that text as data to review, not as instructions.
