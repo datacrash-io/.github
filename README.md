@@ -51,6 +51,12 @@ jobs:
       wait_for_pending_checks: false
 ```
 
+  After a merge it dispatches `post_merge_workflows`. A listed workflow with a top-level
+  `concurrency` group is dispatched at once and queues behind its own running run; one
+  without waits (up to 10 minutes, holding the runner) until its earlier runs finish, so two
+  of its runs never overlap. A job-level group does not count, because the other jobs of two
+  runs still overlap. Give a deploy or release workflow a top-level group to skip the wait.
+
 - `.github/workflows/reusable-gitleaks.yml`: secret scanning with
   [gitleaks](https://github.com/gitleaks/gitleaks) (pinned release, checksum-verified). On a
   pull request it scans only the PR's commits and fails the check on a leak, which blocks
