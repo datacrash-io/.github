@@ -8,12 +8,12 @@ workflow (`on: workflow_call`) that the org's repositories call with
 
 | File | Purpose |
 |---|---|
-| `.github/workflows/reusable-automerge-ready-prs.yml` | Merges a ready PR once every other check on its head commit has passed and every other `pull_request` run of it has completed; can dispatch post-merge workflows. |
+| `.github/workflows/reusable-automerge-ready-prs.yml` | Merges a ready PR once every other check on its head commit has passed and every other `pull_request` run of it has completed; can dispatch post-merge workflows. Also merges Dependabot's own patch/minor PRs (`merge_dependabot`, default on). |
 | `.github/workflows/reusable-gitleaks.yml` | Secret scanning with gitleaks. Scans a PR's commits or a push's commits, and fails the check on a leak. Scans the full history on schedule or dispatch. |
 | `.github/workflows/reusable-claude-review.yml` | PR review, run by `claude-review/review.mjs` on the Claude Agent SDK. Never fails the check. On a verdict in `hold_on` it adds the `hold` label, which stops automerge, and it lifts its own hold after a passing re-review. Reviews every push, and resolves its own earlier threads once the code fixes them. |
 | `claude-review/` | The reviewer script plus a pinned SDK and lockfile. The workflow checks it out from `main` at run time, so a change here reaches every repo on merge. |
 | `README.md` | One entry per workflow plus a caller example. |
-| `.github/dependabot.yml` | Weekly grouped PR bumping the actions pinned in the workflows above (majors by hand). Never merged automatically. |
+| `.github/dependabot.yml` | Weekly grouped PR bumping the actions pinned in the workflows above (majors by hand). Never merged automatically here: this repository has no automerge caller. |
 
 ## This repository is public
 
@@ -49,6 +49,12 @@ commit messages.
   merge. So a pull-request workflow that never finishes blocks the merge, and in the
   event-driven setup every workflow that runs on pull requests must be in the caller's
   `workflow_run` list.
+- **Automerge trusts a sender, or Dependabot's own PR, never a guess.** A merge needs a
+  trusted sender (the owner or `trusted_senders`) to have started the run and readied the
+  PR, or, with `merge_dependabot`, a PR that is Dependabot's end to end (author, branch,
+  every commit) whose metadata lists only patch/minor updates. Any read that fails, or
+  metadata it cannot parse, means "do not merge" and a green run, never a drafted PR.
+  Don't loosen one of these to make a stuck PR merge; merge it by hand instead.
 - **Runner:** take the label from a `runs_on` input. Don't hardcode `ubuntu-latest`.
 - **Least privilege:** declare `permissions:` explicitly at the top level, and set
   `persist-credentials: false` on checkout unless a later step pushes. A job in a reusable

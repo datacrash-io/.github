@@ -1,3 +1,16 @@
+# Merges a ready PR once every other check on its head has passed and every other
+# pull_request run of that head has completed, then dispatches post_merge_workflows.
+#
+# - pull_request (a trusted sender's ready/sync/unlabeled-hold event): merges when the
+#   checks allow it, polling or not per wait_for_pending_checks.
+# - workflow_run (a listed PR workflow finished): checks once and exits. Merges a PR a
+#   trusted sender readied, when a trusted sender started the finished run, and, with
+#   merge_dependabot (default on), a Dependabot PR on its own: Dependabot's branch and
+#   commits only, and only patch/minor updates per its commit metadata. A major, an
+#   update with no update type, or a person's commit on the branch leaves it for a
+#   person; the run stays green and the PR is not drafted or labelled.
+# Inputs are documented below; the job and step comments explain each guard.
+
 name: Reusable - Automerge Ready PRs
 
 on:
@@ -84,6 +97,26 @@ on:
         required: false
         type: string
         default: '["self-hosted", "linux"]'
+      merge_dependabot:
+        description: >-
+          Default true: also merge a Dependabot PR on its own, without a trusted
+          sender having readied it, when every listed dependency is a semver patch
+          or minor update. Only on the `workflow_run` path, only for a run
+          Dependabot started (attempted by Dependabot or re-run by a trusted
+          sender) or a trusted sender started, and only for a PR that Dependabot
+          opened from a branch of this repository and whose every commit
+          Dependabot authored. The update types come from the
+          `updated-dependencies:` metadata in the head commit message (what
+          dependabot/fetch-metadata reads); a major, or metadata that is missing
+          or cannot be read, is left for a person and the run exits green. All the
+          usual gates still apply: every check green, nothing pending, no hold
+          label, the merge pinned to the head, post_merge_workflows dispatched.
+          GitHub may refuse a GITHUB_TOKEN merge of a bump that changes
+          `.github/workflows/`; the run then logs that it needs AUTOMERGE_TOKEN
+          and leaves the PR as it is. Set false to merge Dependabot PRs by hand.
+        required: false
+        type: boolean
+        default: true
       hold_label:
         description: >-
           A PR carrying this label is never merged by this workflow. It is read
@@ -131,15 +164,20 @@ jobs:
     # re-run), as the pull_request path checks its event's sender. Resolve only checks
     # who readied the PR, so without this a push by anyone else with write access onto
     # a PR a trusted sender once readied would merge as soon as its CI completed. Fork
-    # heads never qualify. A run Dependabot started is skipped here, before a runner
-    # is requested.
+    # heads never qualify. The one other run let through is one Dependabot started
+    # (actor), attempted by Dependabot or re-run by a trusted sender, and only with
+    # merge_dependabot: Resolve then merges it only as a Dependabot PR (Dependabot's
+    # own branch and commits, patch/minor updates only), never on who readied it.
+    # Every other run is skipped here, before a runner is requested.
     if: >-
       (github.event_name == 'pull_request' && github.event.pull_request.draft == false && (github.event.sender.login == '3h4x' || contains(fromJSON(inputs.trusted_senders), github.event.sender.login))
         && (github.event.action != 'unlabeled' || github.event.label.name == inputs.hold_label))
       || (github.event_name == 'workflow_run' && (github.event.workflow_run.event == 'pull_request' || github.event.workflow_run.event == 'pull_request_target')
         && github.event.workflow_run.head_repository.full_name == github.repository
-        && (github.event.workflow_run.actor.login == '3h4x' || contains(fromJSON(inputs.trusted_senders), github.event.workflow_run.actor.login))
-        && (github.event.workflow_run.triggering_actor.login == '3h4x' || contains(fromJSON(inputs.trusted_senders), github.event.workflow_run.triggering_actor.login)))
+        && (((github.event.workflow_run.actor.login == '3h4x' || contains(fromJSON(inputs.trusted_senders), github.event.workflow_run.actor.login))
+            && (github.event.workflow_run.triggering_actor.login == '3h4x' || contains(fromJSON(inputs.trusted_senders), github.event.workflow_run.triggering_actor.login)))
+          || (inputs.merge_dependabot && github.event.workflow_run.actor.login == 'dependabot[bot]'
+            && (github.event.workflow_run.triggering_actor.login == 'dependabot[bot]' || github.event.workflow_run.triggering_actor.login == '3h4x' || contains(fromJSON(inputs.trusted_senders), github.event.workflow_run.triggering_actor.login)))))
     # One group per PR head. A group holds one running and one pending run, and a newer
     # pending run replaces the older one: with a group per branch, a late completion for
     # an outdated head could replace the pending run for the current head's last
@@ -163,7 +201,10 @@ jobs:
           RUN_PR_NUMBER: ${{ github.event.workflow_run.pull_requests[0].number }}
           RUN_HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
           RUN_NAME: ${{ github.event.workflow_run.name }}
+          RUN_ACTOR: ${{ github.event.workflow_run.actor.login }}
+          RUN_TRIGGERING_ACTOR: ${{ github.event.workflow_run.triggering_actor.login }}
           TRUSTED: ${{ inputs.trusted_senders }}
+          MERGE_DEPENDABOT: ${{ inputs.merge_dependabot }}
         run: |
           set -euo pipefail
 
@@ -207,26 +248,143 @@ jobs:
           head_sha=$(jq -r .headRefOid <<<"$pr")
           readied_by=$(jq -r '.timelineItems.nodes[0].actor.login // .author.login // empty' <<<"$pr")
 
+          # The owner or a trusted_senders login, compared without case as the job's
+          # `if` compares them (GitHub logins are case-insensitive).
+          is_trusted() {
+            [ -n "$1" ] && jq -e --arg u "$1" '(. + ["3h4x"]) | map(ascii_downcase) | index($u | ascii_downcase) != null' <<<"$TRUSTED" >/dev/null
+          }
+
+          # Prints one "<dependency> <update type>" line per entry of the
+          # `updated-dependencies:` YAML block Dependabot writes into its commit
+          # message (between a "---" line and a "..." line, the block
+          # dependabot/fetch-metadata reads), and fails unless there is exactly one
+          # such block, it is closed, it lists at least one dependency, and no
+          # dependency has two update-types. An entry with none (a Docker digest-only
+          # bump, an indirect security update) prints as "unknown", which never merges.
+          dependabot_updates() {
+            awk -v quotes="[\"']" '
+              { sub(/\r$/, "") }
+              state != 1 && prev == "---" && $0 == "updated-dependencies:" { state = 1; blocks++; prev = $0; next }
+              state == 1 && $0 == "..." { state = 2; prev = $0; next }
+              state == 1 && /^- dependency-name:/ {
+                n++; v = $0; sub(/^- dependency-name:[ \t]*/, "", v); gsub(quotes, "", v); name[n] = v; types[n] = 0
+              }
+              state == 1 && /^[ \t]+update-type:/ {
+                if (n == 0) { bad = 1 } else {
+                  v = $0; sub(/^[ \t]+update-type:[ \t]*/, "", v); gsub(quotes, "", v); sub(/[ \t]+$/, "", v)
+                  type[n] = v; types[n]++
+                }
+              }
+              { prev = $0 }
+              END {
+                if (blocks != 1 || state != 2 || n == 0 || bad) exit 1
+                for (i = 1; i <= n; i++) if (types[i] > 1) exit 1
+                for (i = 1; i <= n; i++) print (name[i] == "" ? "?" : name[i]), (type[i] == "" ? "unknown" : type[i])
+              }'
+          }
+
+          # A Dependabot PR may merge without a trusted sender having readied it, but
+          # only when everything about it is Dependabot's: it opened the PR from a
+          # dependabot/ branch of this repository, it authored every commit (a person
+          # who pushed to the branch makes it an ordinary PR again), and every update
+          # it lists is a semver patch or minor. Sets $why when it does not qualify.
+          # Any read that fails means "does not qualify": never merge on a guess.
+          dependabot_pr() {
+            local rest commits count others updates bad_updates head_msg
+            local err="$RUNNER_TEMP/dependabot-error.txt"
+            if ! rest=$(gh api "repos/$REPO/pulls/$number" 2> "$err"); then
+              why="could not read PR #$number to check it is Dependabot's ($(tail -n 1 "$err" | cut -c 1-200))"
+              return 1
+            fi
+            if [ "$(jq -r '.user.login + " " + .user.type' <<<"$rest")" != "dependabot[bot] Bot" ]; then
+              why="PR #$number was made ready by '$readied_by', who is not a trusted sender, and was not opened by Dependabot"
+              return 1
+            fi
+            if [ "$(jq -r '.head.repo.full_name // empty' <<<"$rest")" != "$REPO" ] \
+              || [[ "$(jq -r '.head.ref' <<<"$rest")" != dependabot/* ]] \
+              || [ "$(jq -r '.head.sha' <<<"$rest")" != "$RUN_HEAD_SHA" ]; then
+              why="Dependabot PR #$number is not on a dependabot/ branch of $REPO at $RUN_HEAD_SHA"
+              return 1
+            fi
+            count=$(jq -r '.commits' <<<"$rest")
+            if ! [[ "$count" =~ ^[0-9]+$ ]] || [ "$count" -lt 1 ] || [ "$count" -ge 250 ]; then
+              why="Dependabot PR #$number reports $count commits, which cannot all be listed"
+              return 1
+            fi
+            if ! commits=$(gh api --paginate "repos/$REPO/pulls/$number/commits?per_page=100" \
+                --jq '.[] | {sha, author: .author.login, committer: .committer.login, verified: .commit.verification.verified, message: .commit.message}' 2> "$err") \
+              || ! commits=$(jq -sc . <<<"$commits" 2> "$err"); then
+              why="could not list the commits of Dependabot PR #$number ($(tail -n 1 "$err" | cut -c 1-200))"
+              return 1
+            fi
+            if [ "$(jq 'length' <<<"$commits")" != "$count" ]; then
+              why="listed $(jq 'length' <<<"$commits") commits of Dependabot PR #$number, it reports $count"
+              return 1
+            fi
+            # Dependabot's commits are made through the API: authored by
+            # dependabot[bot], committed as GitHub (web-flow) and signed by it.
+            others=$(jq -c '[.[] | select(.author != "dependabot[bot]"
+              or (.committer != "web-flow" and .committer != "dependabot[bot]")
+              or .verified != true) | {sha: .sha[0:12], author, committer, verified}]' <<<"$commits")
+            if [ "$others" != "[]" ]; then
+              why="Dependabot PR #$number has commits that are not Dependabot's own: $others -- it merges only the way any PR does, readied by a trusted sender"
+              return 1
+            fi
+            head_msg=$(jq -r --arg sha "$RUN_HEAD_SHA" '.[] | select(.sha == $sha) | .message' <<<"$commits")
+            if [ -z "$head_msg" ]; then
+              why="the head commit $RUN_HEAD_SHA is not among the commits of Dependabot PR #$number"
+              return 1
+            fi
+            if ! updates=$(dependabot_updates <<<"$head_msg"); then
+              why="the head commit of Dependabot PR #$number has no readable updated-dependencies metadata, so its update types are unknown -- leaving it for a person"
+              return 1
+            fi
+            echo "Dependabot updates in PR #$number:"
+            while read -r dep kind; do echo "  $dep $kind"; done <<<"$updates"
+            bad_updates=$(awk '$2 != "version-update:semver-patch" && $2 != "version-update:semver-minor"' <<<"$updates")
+            if [ -n "$bad_updates" ]; then
+              why="Dependabot PR #$number includes an update that is not a semver patch or minor ($(paste -sd ';' - <<<"$bad_updates")) -- leaving it for a person"
+              return 1
+            fi
+            return 0
+          }
+
           skip=""
+          dependabot=false
+          why=""
           if [ "$state" != "OPEN" ]; then
             skip="PR #$number is $state"
           elif [ "$draft" = "true" ]; then
             skip="PR #$number is a draft"
           elif [ "$head_sha" != "$RUN_HEAD_SHA" ]; then
             skip="PR #$number has moved on to $head_sha; that commit's own checks will re-trigger this"
-          elif [ "$readied_by" != "3h4x" ] && ! jq -e --arg u "$readied_by" 'index($u) != null' <<<"$TRUSTED" >/dev/null; then
-            skip="PR #$number was made ready by '$readied_by', who is not a trusted sender"
+          elif is_trusted "$RUN_ACTOR" && is_trusted "$RUN_TRIGGERING_ACTOR" && is_trusted "$readied_by"; then
+            : # the ordinary path: a trusted sender started the run and readied the PR
+          elif [ "$MERGE_DEPENDABOT" != "true" ]; then
+            if is_trusted "$RUN_ACTOR" && is_trusted "$RUN_TRIGGERING_ACTOR"; then
+              skip="PR #$number was made ready by '$readied_by', who is not a trusted sender"
+            else
+              skip="$RUN_NAME was started by '$RUN_ACTOR' (this attempt by '$RUN_TRIGGERING_ACTOR'), not a trusted sender, and merge_dependabot is off"
+            fi
+          elif dependabot_pr; then
+            dependabot=true
+          else
+            skip="$why"
           fi
           if [ -n "$skip" ]; then
             echo "$skip -- not merging."
             echo "proceed=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
+          if [ "$dependabot" = "true" ]; then
+            echo "Dependabot PR #$number: every commit is Dependabot's and every update is a patch or minor -- merging it once every check passes."
+          fi
 
           {
             echo "number=$number"
             echo "head_sha=$head_sha"
             echo "head_ref=$(jq -r .headRefName <<<"$pr")"
+            echo "dependabot=$dependabot"
             echo "proceed=true"
           } >> "$GITHUB_OUTPUT"
 
@@ -249,6 +407,8 @@ jobs:
           ALLOW_NO_CHECKS: ${{ inputs.allow_merge_with_no_checks }}
           WAIT_FOR_PENDING: ${{ github.event_name == 'pull_request' && inputs.wait_for_pending_checks }}
           HOLD_LABEL: ${{ inputs.hold_label }}
+          DEPENDABOT: ${{ steps.pr.outputs.dependabot }}
+          HAS_AUTOMERGE_TOKEN: ${{ secrets.AUTOMERGE_TOKEN != '' }}
         run: |
           set -euo pipefail
 
@@ -461,6 +621,19 @@ jobs:
                 exit 0
               fi
               cat "$RUNNER_TEMP/merge-error.txt" >&2
+              # A Dependabot bump of .github/workflows/ that GitHub refuses to merge with
+              # this token: nothing on the PR is wrong, so leave it as it is (no draft, no
+              # comment) for a person to merge, or for a token with the workflow scope.
+              if [ "$DEPENDABOT" = "true" ] && grep -q 'without .workflows. permission' "$RUNNER_TEMP/merge-error.txt"; then
+                if [ "$HAS_AUTOMERGE_TOKEN" = "true" ]; then
+                  token_hint="AUTOMERGE_TOKEN is set but lacks the workflow scope for this repository"
+                else
+                  token_hint="merging it automatically needs an AUTOMERGE_TOKEN secret with the workflow scope"
+                fi
+                echo "::notice::Dependabot PR #$PR_NUMBER changes .github/workflows/ and GitHub refused this token's merge -- $token_hint. Left ready and untouched; merge it by hand."
+                echo "### Not merged: Dependabot PR #$PR_NUMBER changes \`.github/workflows/\` ($token_hint)" >> "$GITHUB_STEP_SUMMARY"
+                exit 0
+              fi
               exit 1
             fi
 
@@ -914,8 +1087,10 @@ jobs:
           gh pr comment "$PR_NUMBER" --repo "$REPO" --body \
             "This PR merged, but re-triggering \`$WORKFLOWS\` failed even after 5 retries -- a merge commit pushed by GITHUB_TOKEN never fires push-based workflows on its own (GitHub's anti-recursion rule), so **this change is merged to main but has not been deployed**. Trigger it by hand: \`gh workflow run <workflow-file> --repo $REPO --ref main\`. Failure details: $RUN_URL"
 
+      # Not for a Dependabot branch: Dependabot owns its branch names and can need
+      # one again (a later PR for the same update), and locking it would block that PR.
       - name: Block the merged branch from ever being recreated
-        if: steps.merge.outputs.merged_by_this_run == 'true'
+        if: steps.merge.outputs.merged_by_this_run == 'true' && steps.pr.outputs.dependabot != 'true'
         env:
           GH_TOKEN: ${{ secrets.RULESET_TOKEN }}
           REPO: ${{ github.repository }}
