@@ -63,6 +63,35 @@ jobs:
   automerge; on push it scans only the pushed commits; on schedule/dispatch the full history. Findings are redacted. Tune with a
   root `.gitleaks.toml`; silence a reviewed false positive via `.gitleaksignore`. Exists
   because GitHub's own secret scanning needs Advanced Security on private repos.
+- `actions/tested-tree` (a composite action, not a workflow): outputs `tested=true` when a
+  successful `pull_request` run of the listed CI workflow(s) already tested exactly the tree of
+  the commit being run, so a post-merge test job (a deploy's `test`) can skip its steps. It needs
+  that run's head commit to have the same tree, and the commit's first parent to be an ancestor
+  of that head, which together mean CI tested exactly this code. Anything it cannot establish
+  means `tested=false` and the tests run; the step never fails. Needs `actions: read` and
+  `contents: read`. Guard the steps of the test job, not the job: a skipped job also skips every
+  job that needs it, even indirectly.
+
+```yaml
+on:
+  workflow_call:
+    inputs:
+      skip_if_tested:
+        description: "Skip the steps when PR CI already passed on this exact tree (deploys only)."
+        type: boolean
+        default: false
+jobs:
+  test:
+    steps:
+      - id: tested
+        if: inputs.skip_if_tested
+        uses: datacrash-io/.github/actions/tested-tree@main
+        with:
+          ci_workflows: ci.yml
+      - uses: actions/checkout@<sha> # every later step gets the same guard
+        if: steps.tested.outputs.tested != 'true'
+```
+
 - `.github/workflows/reusable-claude-review.yml`: advisory PR review run by
   `claude-review/review.mjs` on the Claude Agent SDK: one review with inline comments. Not
   `anthropics/claude-code-action`, because that runs Claude Code, which API credits granted with
