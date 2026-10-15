@@ -14,8 +14,20 @@ Shared GitHub Actions workflows for datacrash-io repositories.
   of them finishes, so no job holds a runner while checks run. The input still defaults to
   `true` (poll and wait) while callers are moved over. A finished run only starts a merge
   when a trusted sender (the owner account or `trusted_senders`) started it and its head is
-  in this repository, so a run Dependabot started is skipped before a runner is requested.
-  Each run answers for one PR head and stops once the PR has moved on.
+  in this repository. Each run answers for one PR head and stops once the PR has moved on.
+
+  **Dependabot PRs merge on their own** (`merge_dependabot`, default `true`; set `false` to
+  merge them by hand). On the `workflow_run` path a run Dependabot started is let through,
+  and the PR merges once its checks pass only if Dependabot opened it from a `dependabot/`
+  branch of the repository, Dependabot authored every commit on it, and every dependency in
+  the `updated-dependencies:` metadata of its head commit is a `semver-patch` or
+  `semver-minor` update. A major, an entry with no update type (a Docker digest-only bump,
+  an indirect security update), or a person's commit on the branch leaves the PR for a
+  person, with the reason in the run log; the run stays green and the PR is not drafted.
+  Every other gate (checks, unfinished runs, `hold`, the pinned head, `post_merge_workflows`)
+  is the same as for any PR, so the merge deploys as usual. GitHub may refuse a
+  `GITHUB_TOKEN` merge of a bump that changes `.github/workflows/`; the run then logs that
+  it needs an `AUTOMERGE_TOKEN` secret with the `workflow` scope and leaves the PR ready.
 
 ```yaml
 on:

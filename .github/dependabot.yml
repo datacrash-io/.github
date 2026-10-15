@@ -13,9 +13,9 @@
 # - The minor-patch group has no update-types filter on purpose: a SHA-pinned action is
 #   neither minor nor patch, and would otherwise get a PR of its own.
 #
-# Nothing here is merged automatically: this repository has no automerge workflow, and the
-# shared automerge never acts on a run Dependabot started. Review and merge by hand, keeping in
-# mind that the merge reaches every caller at once.
+# Nothing here is merged automatically: this repository has no automerge workflow (the shared
+# automerge merges Dependabot's patch/minor PRs only in the repositories that call it). Review
+# and merge by hand, keeping in mind that the merge reaches every caller at once.
 #
 # Not listed: claude-review/'s npm package. Its Agent SDK is pinned on purpose with a lockfile;
 # a bump changes the reviewer in every repository on merge, so it is done by hand.
