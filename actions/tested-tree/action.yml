@@ -1,0 +1,94 @@
+name: Tested tree
+description: >-
+  Outputs tested=true when a successful pull_request run of the repository's CI already tested
+  exactly the tree of the commit this job runs on, so a post-merge test job can skip its steps.
+
+# A deploy that runs after a merge usually re-runs the test suite the PR's CI already passed. That
+# is redundant when the code being deployed is byte-for-byte the code the PR's CI tested. This
+# action decides that, and nothing else; the caller guards its test steps with
+# `if: steps.<id>.outputs.tested != 'true'`.
+#
+# tested=true needs all of these, for the commit C being run (github.sha):
+#   1. a pull_request run of every workflow in `ci_workflows` that concluded success, whose head
+#      commit H has the same tree as C (the run object's head_commit.tree_id);
+#   2. C's first parent P is an ancestor of H (or equal to it).
+# Why 2: a pull_request run tests the merge of H into the base branch as it was then, not H itself.
+# That base was an earlier commit of the base branch, so an ancestor of P, so an ancestor of H; the
+# merge of H with its own ancestor is H's tree. With 1 that is C's tree: CI tested exactly C.
+# Equal trees also mean the workflow files, lockfiles and test code are the same ones that ran.
+#
+# Anything it cannot establish (no matching run, an API error, a missing tool, a first commit)
+# outputs tested=false, so the tests run. This step itself never fails.
+#
+# Token: needs `actions: read` and `contents: read` (a caller with a top-level `permissions:` block
+# must grant `actions: read`; without it the lookup fails and the tests run).
+
+inputs:
+  ci_workflows:
+    description: >-
+      Space-separated workflow file names (e.g. 'ci.yml', or 'ci.yml test.yml') that run on the
+      repository's pull requests. Every one of them must have a successful pull_request run of a
+      commit with this tree. List the workflow(s) whose jobs are the tests being skipped.
+    required: true
+  max_runs:
+    description: Most recent successful pull_request runs of each workflow to search (1-100).
+    required: false
+    default: '100'
+  token:
+    description: Token for the API reads.
+    required: false
+    default: ${{ github.token }}
+
+outputs:
+  tested:
+    description: "'true' when CI already tested this exact tree, else 'false'."
+    value: ${{ steps.check.outputs.tested }}
+  run_url:
+    description: The matching CI run (of the first listed workflow), when tested is 'true'.
+    value: ${{ steps.check.outputs.run_url }}
+
+runs:
+  using: composite
+  steps:
+    - id: check
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.token }}
+        CI_WORKFLOWS: ${{ inputs.ci_workflows }}
+        MAX_RUNS: ${{ inputs.max_runs }}
+      run: |
+        set -uo pipefail
+        no() {
+          echo "::notice::Running the tests: $1"
+          echo "tested=false" >> "$GITHUB_OUTPUT"
+          exit 0
+        }
+        if ! command -v gh >/dev/null || ! command -v jq >/dev/null; then no "gh or jq is not installed"; fi
+        [[ "$MAX_RUNS" =~ ^[0-9]+$ ]] && [ "$MAX_RUNS" -ge 1 ] && [ "$MAX_RUNS" -le 100 ] || no "max_runs must be 1-100"
+        [ -n "${CI_WORKFLOWS// /}" ] || no "ci_workflows is empty"
+        repo="$GITHUB_REPOSITORY"
+        commit=$(gh api "repos/$repo/commits/$GITHUB_SHA" --jq '[.commit.tree.sha, (.parents[0].sha // "")] | @tsv') \
+          || no "could not read commit $GITHUB_SHA"
+        read -r tree parent <<< "$commit"
+        [ -n "$tree" ] && [ -n "$parent" ] || no "commit $GITHUB_SHA has no parent"
+
+        first_url=""
+        for wf in $CI_WORKFLOWS; do
+          [[ "$wf" =~ ^[A-Za-z0-9._-]+$ ]] || no "invalid workflow name '$wf'"
+          runs=$(gh api "repos/$repo/actions/workflows/$wf/runs?event=pull_request&status=success&per_page=$MAX_RUNS" \
+            --jq ".workflow_runs[] | select(.head_commit.tree_id == \"$tree\") | [.head_sha, .html_url] | @tsv") \
+            || no "could not list $wf runs"
+          found=""
+          while read -r head url; do
+            [ -n "$head" ] || continue
+            # P must be an ancestor of (or equal to) H: compare P...H is "ahead" or "identical".
+            status=$(gh api "repos/$repo/compare/$parent...$head" --jq .status 2>/dev/null) || continue
+            if [ "$status" = ahead ] || [ "$status" = identical ]; then found="$url"; break; fi
+          done <<< "$runs"
+          [ -n "$found" ] || no "no successful pull_request run of $wf tested tree $tree with ${parent:0:7} as an ancestor"
+          echo "$wf: $found"
+          [ -n "$first_url" ] || first_url="$found"
+        done
+        echo "::notice::Skipping the tests: CI already passed on this exact tree ($first_url)"
+        echo "tested=true" >> "$GITHUB_OUTPUT"
+        echo "run_url=$first_url" >> "$GITHUB_OUTPUT"

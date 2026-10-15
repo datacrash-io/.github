@@ -2,7 +2,8 @@
 
 Shared GitHub Actions for the `datacrash-io` organization. Every workflow here is a reusable
 workflow (`on: workflow_call`) that the org's repositories call with
-`uses: datacrash-io/.github/.github/workflows/<file>@main`. Nothing in this repo runs on its own.
+`uses: datacrash-io/.github/.github/workflows/<file>@main`; `actions/` holds composite actions,
+called as a step with `uses: datacrash-io/.github/actions/<name>@main`. Nothing in this repo runs on its own.
 
 ## What is here
 
@@ -11,6 +12,7 @@ workflow (`on: workflow_call`) that the org's repositories call with
 | `.github/workflows/reusable-automerge-ready-prs.yml` | Merges a ready PR once every other check on its head commit has passed and every other `pull_request` run of it has completed; can dispatch post-merge workflows. Also merges Dependabot's own patch/minor PRs (`merge_dependabot`, default on). |
 | `.github/workflows/reusable-gitleaks.yml` | Secret scanning with gitleaks. Scans a PR's commits or a push's commits, and fails the check on a leak. Scans the full history on schedule or dispatch. |
 | `.github/workflows/reusable-claude-review.yml` | PR review, run by `claude-review/review.mjs` on the Claude Agent SDK. Never fails the check. On a verdict in `hold_on` it adds the `hold` label, which stops automerge, and it lifts its own hold after a passing re-review. Reviews every push, and resolves its own earlier threads once the code fixes them. |
+| `actions/tested-tree/action.yml` | Composite action: `tested=true` when a successful `pull_request` CI run already tested exactly this commit's tree (same tree, and the commit's parent is an ancestor of that run's head). Lets a post-merge test job skip its steps; anything it cannot establish runs the tests. |
 | `claude-review/` | The reviewer script plus a pinned SDK and lockfile. The workflow checks it out from `main` at run time, so a change here reaches every repo on merge. |
 | `README.md` | One entry per workflow plus a caller example. |
 | `.github/dependabot.yml` | Weekly grouped PR bumping the actions pinned in the workflows above (majors by hand). Never merged automatically here: this repository has no automerge caller. |
