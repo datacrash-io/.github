@@ -29,6 +29,11 @@ Shared GitHub Actions workflows for datacrash-io repositories.
   `GITHUB_TOKEN` merge of a bump that changes `.github/workflows/`; the run then logs that
   it needs an `AUTOMERGE_TOKEN` secret with the `workflow` scope and leaves the PR ready.
 
+  **Linked issues are closed after the merge.** GitHub ignores closing keywords (`Closes #N`)
+  on a merge made with `GITHUB_TOKEN`, so the workflow closes each open issue in the same
+  repository that the PR links, with a comment naming the PR. A failure only warns. The
+  caller must grant `issues: write`; without it the job cannot start.
+
 ```yaml
 on:
   pull_request:
@@ -40,6 +45,7 @@ on:
 permissions:
   contents: write
   pull-requests: write
+  issues: write
   checks: read
   statuses: read
   actions: write
