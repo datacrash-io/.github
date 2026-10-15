@@ -9,6 +9,8 @@
 #   commits only, and only patch/minor updates per its commit metadata. A major, an
 #   update with no update type, or a person's commit on the branch leaves it for a
 #   person; the run stays green and the PR is not drafted or labelled.
+# After a merge it closes the open issues the PR links, since GitHub ignores closing
+# keywords on a GITHUB_TOKEN merge. Callers must grant issues: write.
 # Inputs are documented below; the job and step comments explain each guard.
 
 name: Reusable - Automerge Ready PRs
@@ -152,6 +154,7 @@ on:
 permissions:
   contents: write
   pull-requests: write
+  issues: write
   checks: read
   statuses: read
   actions: write
@@ -689,6 +692,50 @@ jobs:
             gh pr comment "$PR_NUMBER" --repo "$REPO" --body \
               "Automerge failed, so this PR was moved back to draft instead of being left stuck ready-for-review with failing checks. See the run for why: $RUN_URL. Fix the issue and mark it ready for review again to retry."
           fi
+
+      # GitHub ignores closing keywords ("Closes #N") on a merge made with GITHUB_TOKEN,
+      # so the issues the PR links stay open. Close them here. Best effort: a failure
+      # only warns, the merge has already happened.
+      - name: Close the issues the PR links
+        if: steps.merge.outputs.merged_by_this_run == 'true'
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ steps.pr.outputs.number }}
+        run: |
+          set -uo pipefail
+          # shellcheck disable=SC2016
+          query='query($owner: String!, $name: String!, $number: Int!) {
+            repository(owner: $owner, name: $name) {
+              pullRequest(number: $number) {
+                closingIssuesReferences(first: 50) {
+                  nodes { number state repository { nameWithOwner } }
+                }
+              }
+            }
+          }'
+          if ! issues=$(gh api graphql -f query="$query" -F owner="${REPO%/*}" -F name="${REPO#*/}" -F number="$PR_NUMBER" \
+              --jq '.data.repository.pullRequest.closingIssuesReferences.nodes[] | select(.state == "OPEN") | "\(.repository.nameWithOwner) \(.number)"'); then
+            echo "::warning::Could not read the issues PR #$PR_NUMBER links; close them by hand."
+            exit 0
+          fi
+          if [ -z "$issues" ]; then
+            echo "PR #$PR_NUMBER links no open issue."
+            exit 0
+          fi
+          while read -r issue_repo issue_number; do
+            # GITHUB_TOKEN reaches only this repository; an issue elsewhere is left to a person.
+            if [ "$issue_repo" != "$REPO" ]; then
+              echo "::warning::$issue_repo#$issue_number is in another repository; close it by hand."
+              continue
+            fi
+            if gh issue close "$issue_number" --repo "$REPO" --reason completed --comment "Closed by #$PR_NUMBER."; then
+              echo "Closed #$issue_number."
+            else
+              echo "::warning::Could not close #$issue_number (linked from PR #$PR_NUMBER); close it by hand."
+            fi
+          done <<< "$issues"
 
       - name: Re-trigger post-merge workflows
         if: inputs.post_merge_workflows != '' && success() && steps.merge.outputs.merged_by_this_run == 'true'
