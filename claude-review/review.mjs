@@ -204,10 +204,14 @@ function replyToThread(threadId, reply) {
 // body, the earlier review and its still-open threads) instead of the whole PR diff.
 // Anything it can't establish falls back to a full review: a re-run (a person asking
 // for a fresh look), no earlier marked review, a force-push or rebase (the marked commit
-// is not an ancestor of head), a failed lookup, or a PR that touches .github/. A PR
-// that changes workflows gets a full review every time, also because a workflow in the
-// PR runs with this repository's token and could post a forged marker; such a PR could
-// equally remove the hold label itself, so the full review is what has to catch it.
+// is not an ancestor of head), a diff it can't parse, a failed lookup, or a PR that
+// touches .github/.
+// The marker alone is never trusted: every workflow a same-repo PR adds posts as the
+// same bot, so a PR could post a marker for a commit nobody reviewed. A marker counts
+// only when this review job's own check (same check name, run by GitHub Actions, from a
+// pull_request run of the same caller workflow file) concluded success on exactly that
+// commit. Those lookups need `actions: read` and `checks: read`; without them every
+// review is a full one. Every head still gets a model call.
 const RANK = ["looks good", "minor issues", "needs changes"];
 const marker = (sha, verdict) => `<!-- claude-review sha=${sha} verdict="${verdict}" -->`;
 // Anchored to the end of the body: the model writes the text before it, so a marker it was
@@ -229,13 +233,41 @@ function lastMarkedReview() {
 }
 
 // Splits a unified diff into per-file blocks and keeps those touching one of `files`.
+// Returns null when a block's header can't be read (git quotes paths with special or
+// non-ASCII characters), so the caller does a full review rather than drop that file.
 function diffForFiles(diff, files) {
-  return diff.split(/^(?=diff --git )/m).filter((block) => {
-    const paths = [...block.matchAll(/^(?:--- a\/|\+\+\+ b\/)(.+)$/gm)].map((m) => m[1]);
-    const header = block.match(/^diff --git a\/(.+?) b\/(.+)$/m);
-    if (header) paths.push(header[1], header[2]);
-    return paths.some((p) => files.has(p));
-  }).join("");
+  const blocks = diff.split(/^(?=diff --git )/m).filter(Boolean);
+  const kept = [];
+  for (const block of blocks) {
+    const header = block.match(/^diff --git a\/(\S.*?) b\/(\S.*)$/m);
+    if (!block.startsWith("diff --git ") || !header || /^(?:diff --git|---|\+\+\+) "/m.test(block.split(/^@@/m)[0])) return null;
+    const paths = [header[1], header[2], ...[...block.matchAll(/^(?:--- a\/|\+\+\+ b\/)(.+)$/gm)].map((m) => m[1])];
+    if (paths.some((p) => files.has(p))) kept.push(block);
+  }
+  return kept.join("");
+}
+
+// This job's check name (e.g. "claude-review / review") and the caller workflow file of
+// this run, read from the Actions API.
+function ownCheck() {
+  const jobs = JSON.parse(gh(["api", `repos/${REPO}/actions/runs/${env.GITHUB_RUN_ID}/attempts/${env.GITHUB_RUN_ATTEMPT || 1}/jobs?per_page=100`,
+    "--jq", "[.jobs[] | {name, runner_name, status}]"]));
+  const mine = jobs.filter((j) => j.runner_name === env.RUNNER_NAME && j.status === "in_progress");
+  if (mine.length !== 1) return null;
+  const path = gh(["api", `repos/${REPO}/actions/runs/${env.GITHUB_RUN_ID}`, "--jq", ".path"]).trim();
+  return path ? { name: mine[0].name, path } : null;
+}
+
+// True only when this review job's check concluded success on exactly `sha`.
+function reviewedByThisJob(sha, own) {
+  const ids = JSON.parse(gh(["api", `repos/${REPO}/commits/${sha}/check-runs?check_name=${encodeURIComponent(own.name)}&filter=all&per_page=100`,
+    "--jq", `[.check_runs[] | select(.app.slug == "github-actions" and .conclusion == "success" and .head_sha == "${sha}") | .id]`]));
+  for (const id of ids) {
+    const runId = gh(["api", `repos/${REPO}/actions/jobs/${id}`, "--jq", ".run_id"]).trim();
+    const run = JSON.parse(gh(["api", `repos/${REPO}/actions/runs/${runId}`, "--jq", "{path, event, head_sha}"]));
+    if (run.path === own.path && run.event === "pull_request" && run.head_sha === sha) return true;
+  }
+  return false;
 }
 
 // Returns { from, verdict, body, diff } for an incremental review, or { reason } for a full one.
@@ -246,11 +278,15 @@ function planIncremental(fullDiff) {
   if ([...files].some(SENSITIVE)) return { reason: "the PR touches .github/" };
   const prev = lastMarkedReview();
   if (!prev) return { reason: "no earlier review with a marker" };
+  const own = ownCheck();
+  if (!own) return { reason: "could not identify this review job's own check" };
+  if (!reviewedByThisJob(prev.sha, own)) return { reason: `no successful run of this review job on ${prev.sha.slice(0, 7)}` };
   if (prev.sha === env.HEAD_SHA) return { from: prev.sha, verdict: prev.verdict, body: prev.body, diff: "" };
   const status = gh(["api", `repos/${REPO}/compare/${prev.sha}...${env.HEAD_SHA}`, "--jq", ".status"]).trim();
   if (status !== "ahead") return { reason: `the last reviewed commit ${prev.sha.slice(0, 7)} is not an ancestor of head (${status}): force-push or rebase` };
   // Only the PR's own files: a merge of the base branch brings in changes main already reviewed.
   const diff = diffForFiles(gh(["api", "-H", "Accept: application/vnd.github.diff", `repos/${REPO}/compare/${prev.sha}...${env.HEAD_SHA}`]), files);
+  if (diff === null) return { reason: "the changes since the last review have a path it can't parse" };
   if (diff.length >= fullDiff.length) return { reason: "the changes since the last review are no smaller than the PR" };
   return { from: prev.sha, verdict: prev.verdict, body: prev.body, diff };
 }
@@ -290,8 +326,8 @@ function applyHold(hold, before, verdict) {
 async function main() {
   const meta = JSON.parse(gh(["pr", "view", PR, "--repo", REPO, "--json", "title,body,baseRefName,headRefName,headRefOid"]));
   const output = (resolve) => env.GITHUB_OUTPUT && appendFileSync(env.GITHUB_OUTPUT, `resolve=${JSON.stringify(resolve)}\n`);
-  // A run that starts after a newer push (queued, or a re-run of an old head) spends
-  // nothing: the newer push's own review decides.
+  // A run for a head the PR has already left (queued behind, delivered late, or a re-run
+  // of an old head) spends nothing and posts nothing: the newer push's own review decides.
   if (env.HEAD_SHA && meta.headRefOid !== env.HEAD_SHA) {
     console.log(`PR moved on to ${meta.headRefOid.slice(0, 7)} before this review started; leaving it to that push's review.`);
     output([]);
@@ -312,15 +348,6 @@ async function main() {
   if (truncated) reviewDiff = reviewDiff.slice(0, MAX_DIFF_CHARS);
 
   const earlier = openOwnThreads();
-  // Same head already reviewed (reopened, or readied again after automerge drafted it)
-  // and nothing left open to re-check: apply that review's verdict to the label again
-  // without calling the model.
-  if (incremental && plan.from === env.HEAD_SHA && earlier.length === 0) {
-    console.log(`This head was already reviewed (verdict: ${plan.verdict}); re-applying that verdict, no new review.`);
-    applyHold(HOLD_ON.includes(plan.verdict), holdState(), plan.verdict);
-    output([]);
-    return;
-  }
 
   // A PR can add a symlink (e.g. to /proc/self/environ) whose in-repo path matches the
   // Read(./**) allow rule, so the realpath check in canUseTool would never run. The
@@ -410,6 +437,13 @@ ${EXTRA ? `\nRepository-specific focus: ${EXTRA}\n` : ""}${earlierBlock}${increm
 ${reviewDiff}
 </diff>`;
 
+  // Checked again right before the model call: the setup above takes a while.
+  if (env.HEAD_SHA && currentHead() !== env.HEAD_SHA) {
+    rmSync(work, { recursive: true, force: true });
+    console.log("PR moved on before the model call; leaving it to that push's review.");
+    output([]);
+    return;
+  }
   let result;
   try {
     for await (const m of query({

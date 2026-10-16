@@ -11,7 +11,7 @@ called as a step with `uses: datacrash-io/.github/actions/<name>@main`. Nothing 
 |---|---|
 | `.github/workflows/reusable-automerge-ready-prs.yml` | Merges a ready PR once every other check on its head commit has passed and every other `pull_request` run of it has completed; can dispatch post-merge workflows. Also merges Dependabot's own patch/minor PRs (`merge_dependabot`, default on). |
 | `.github/workflows/reusable-gitleaks.yml` | Secret scanning with gitleaks. Scans a PR's commits or a push's commits, and fails the check on a leak. Scans the full history on schedule or dispatch. |
-| `.github/workflows/reusable-claude-review.yml` | PR review, run by `claude-review/review.mjs` on the Claude Agent SDK. Never fails the check. On a verdict in `hold_on` it adds the `hold` label, which stops automerge, and it lifts its own hold after a passing re-review. Reviews every push (incrementally after the first review: only the commits since the last reviewed head, full again after a force-push, a re-run or when the PR touches `.github/`), a new push cancels the review of the old head, and it resolves its own earlier threads once the code fixes them. |
+| `.github/workflows/reusable-claude-review.yml` | PR review, run by `claude-review/review.mjs` on the Claude Agent SDK. Never fails the check. On a verdict in `hold_on` it adds the `hold` label, which stops automerge, and it lifts its own hold after a passing re-review. Reviews every push (incrementally after the first review: only the commits since the last reviewed head, full again after a force-push, a re-run or when the PR touches `.github/`), a run for a head the PR has left exits before the model call, and it resolves its own earlier threads once the code fixes them. |
 | `actions/tested-tree/action.yml` | Composite action: `tested=true` when a successful `pull_request` CI run already tested exactly this commit's tree (same tree, and the commit's parent is an ancestor of that run's head). Lets a post-merge test job skip its steps; anything it cannot establish runs the tests. |
 | `claude-review/` | The reviewer script plus a pinned SDK and lockfile. The workflow checks it out from `main` at run time, so a change here reaches every repo on merge. |
 | `README.md` | One entry per workflow plus a caller example. |
@@ -40,9 +40,7 @@ commit messages.
 - **Automerge waits for every other check, and a failed or cancelled check blocks the merge.**
   A check that is only informational must never go red: use `continue-on-error` on the step,
   a step `timeout-minutes` below the job's, and no `cancel-in-progress` concurrency on
-  pull-request jobs that can cancel a run of the PR's current head. (The Claude review
-  cancels only on `synchronize`, first attempt: that cancels the old head's run, whose check
-  automerge never reads.) A check that should block, like gitleaks, fails on purpose and says
+  pull-request jobs. A check that should block, like gitleaks, fails on purpose and says
   why in an `::error::` line.
 - **Automerge also waits for every unfinished `pull_request` / `pull_request_target` run of
   the PR head, even one with no check yet** (a run queued on a concurrency group has none,
