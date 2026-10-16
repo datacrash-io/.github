@@ -1,8 +1,9 @@
 name: Reusable - Agent branch review release
 
 # The other half of actions/chaos-guard: that action fails every secret-bearing job of a pull request
-# from an agent branch until the owner applies the review label. When the owner applies it, this
-# closes and reopens the pull request, so every pull_request workflow runs again (on `reopened`) and
+# from an agent branch until the owner applies the review label, on the pull request or on an issue it
+# closes. When the owner applies it, this closes and reopens the pull request (for an issue: every open
+# agent pull request that closes it), so every pull_request workflow runs again (on `reopened`) and
 # passes the gate. A label applied by anyone else does nothing here.
 #
 # No checkout and no pull request code: two gh calls. It needs a token whose events trigger workflows
@@ -12,6 +13,8 @@ name: Reusable - Agent branch review release
 # Caller:
 #   on:
 #     pull_request:
+#       types: [labeled]
+#     issues:
 #       types: [labeled]
 #   jobs:
 #     release:
@@ -54,18 +57,34 @@ permissions: {}
 jobs:
   rerun:
     if: >-
-      github.event_name == 'pull_request' && github.event.action == 'labeled'
-      && github.event.label.name == inputs.label && startsWith(github.head_ref, inputs.branch_prefix)
+      github.event.action == 'labeled' && github.event.label.name == inputs.label
       && github.actor == inputs.owner && github.triggering_actor == inputs.owner
       && github.event.sender.login == inputs.owner
+      && ((github.event_name == 'pull_request' && startsWith(github.head_ref, inputs.branch_prefix))
+          || github.event_name == 'issues')
     runs-on: ${{ inputs.runs_on }}
     timeout-minutes: 5
     steps:
-      - name: Close and reopen the pull request so its checks run past the gate
+      - name: Close and reopen the agent pull request(s) so their checks run past the gate
         env:
           GH_TOKEN: ${{ secrets.token }}
+          EVENT_NAME: ${{ github.event_name }}
           PR: ${{ github.event.pull_request.number }}
+          ISSUE: ${{ github.event.issue.number }}
+          PREFIX: ${{ inputs.branch_prefix }}
           REPO: ${{ github.repository }}
         run: |
-          gh pr close "$PR" -R "$REPO" --comment "Reviewed by the owner; re-running the checks."
-          gh pr reopen "$PR" -R "$REPO"
+          set -euo pipefail
+          if [ "$EVENT_NAME" = pull_request ]; then
+            prs=$PR
+          else
+            # The label on an issue: every open agent pull request (head branch with the prefix) that closes it.
+            [[ "$ISSUE" =~ ^[0-9]+$ ]] || { echo "no issue number"; exit 1; }
+            prs=$(gh pr list -R "$REPO" --state open --limit 100 --json number,headRefName,closingIssuesReferences \
+              --jq ".[] | select(.headRefName | startswith(\"$PREFIX\")) | select([.closingIssuesReferences[].number] | index($ISSUE)) | .number")
+          fi
+          [ -n "$prs" ] || { echo "no open agent pull request closes #$ISSUE"; exit 0; }
+          for n in $prs; do
+            gh pr close "$n" -R "$REPO" --comment "Reviewed by the owner; re-running the checks."
+            gh pr reopen "$n" -R "$REPO"
+          done
