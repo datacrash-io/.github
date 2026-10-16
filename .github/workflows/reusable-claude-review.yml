@@ -16,9 +16,13 @@ name: Reusable - Claude PR Review
 # Auth: Workload Identity Federation when the caller passes the anthropic_*
 # identifiers and grants `id-token: write` (no stored key: the job's GitHub OIDC
 # token is exchanged for a short-lived Anthropic token); otherwise the
-# ANTHROPIC_API_KEY secret. Every run calls the Claude API (well under a cent on
-# Haiku). The model defaults to claude-sonnet-5-5; a repo overrides it with
-# its CLAUDE_REVIEW_MODEL variable (see the model input).
+# ANTHROPIC_API_KEY secret.
+#
+# Cost: after the first review of a PR, a push is reviewed incrementally (only the
+# commits since the last reviewed head, plus the earlier review and its open threads);
+# see review.mjs for when it falls back to a full review. Every run calls the Claude
+# API (well under a cent on Haiku). The model defaults to claude-sonnet-5-5; a repo
+# overrides it with its CLAUDE_REVIEW_MODEL variable (see the model input).
 
 on:
   workflow_call:
@@ -101,8 +105,16 @@ jobs:
       !github.event.pull_request.draft &&
       !endsWith(github.event.pull_request.user.login, '[bot]')
     runs-on: ${{ inputs.runs_on }}
-    # No cancel-in-progress concurrency: a cancelled run reports as a failed
-    # check, and the automerge workflow would then refuse the PR.
+    # One review per PR at a time, and a push cancels the review of the head it replaced.
+    # That cancelled check sits on the old commit; automerge reads only the checks of the
+    # PR's current head (and pins the merge to it), so it never sees it, and that head's
+    # own review still has to pass. Only a synchronize run cancels (a push always brings
+    # a new head): a reopened or ready_for_review run of the same head queues instead,
+    # and so does a re-run, so neither can cancel the current head's review. GitHub
+    # still replaces a run that is only queued in the group with the newer one.
+    concurrency:
+      group: claude-review-${{ github.workflow }}-${{ github.event.pull_request.number }}
+      cancel-in-progress: ${{ github.event.action == 'synchronize' && github.run_attempt == 1 }}
     timeout-minutes: 20
     steps:
       # A fork PR gets a read-only token, no id-token and no secrets: it can be neither

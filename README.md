@@ -111,13 +111,21 @@ jobs:
   `hold_on` is set, so an unreviewed head never becomes mergeable; the next completed review
   lifts it. The verdict is never milder than the review's own still-open findings (an open
   high/medium means `needs changes`). Callers trigger on `synchronize` too, so every push is reviewed (automerge waits for that check on
-  the current head), and a passing review lifts a hold the review placed; a review that
+  the current head; a push cancels the review still running for the head it replaced, whose
+  check stays on the old commit), and a passing review lifts a hold the review placed; a review that
   finishes after a newer push leaves the label to the newer review. A `hold` a person
   added is never removed. **Threads:** each run re-checks the review's own open inline
   threads against the current code, resolves the fixed ones with a reply naming the commit,
   and keeps still-valid ones open without re-posting them. To dismiss a finding, reply in its
   thread with the concrete reason it's intended; the next review checks that reason against the
-  code and, if it holds, resolves the thread as accepted. A person's threads are never touched. To override, remove the label and re-run the automerge job. Never fails
+  code and, if it holds, resolves the thread as accepted. A person's threads are never touched.
+  **Incremental:** each review ends in a hidden `<!-- claude-review sha=... verdict="..." -->`
+  marker. When the last marked review covered an ancestor of the current head, the next run
+  reviews only the PR's files changed since that commit, with the earlier review and its open
+  threads as context, and its verdict still covers the whole PR. It reviews the whole PR again
+  when there is no marked review, after a force-push or rebase, on a re-run of the job, or when
+  the PR touches `.github/`. A run for a head that was already reviewed, with no open threads
+  left, re-applies that verdict without calling the model. To override, remove the label and re-run the automerge job. Never fails
   the check (missing key, API error, timeout), so it never blocks automerge. Authenticates
   with Workload Identity Federation when the caller passes the `anthropic_*` identifiers and
   grants `id-token: write` (no stored key), otherwise with the `ANTHROPIC_API_KEY` secret;
