@@ -111,10 +111,11 @@ jobs:
   `release_labels` (default `hold chaos-agent`: the owner's label is the single approval), then closes
   and reopens the pull request when the owner applies the label. Called on `issues: [labeled]` as
   well, it moves an owner's label on an issue to the ONE open same-repository agent-branch pull
-  request by `agent_author` that closes the issue, applying it to that pull request with the token
+  request by `agent_author` that closes the issue (and only that issue), applying it to that pull request with the token
   (as the owner). It does this only if that pull request referenced the issue, and its current head
   was pushed, before the label was applied. The pull-request label event then releases it as above.
-  With no match, or more than one, it changes nothing and comments on the issue. That way its checks run again past the
+  With no match, or more than one, it changes nothing and comments on the issue; if the pull request's head moves while
+  the label is applied, the label is taken off again. An empty `agent_author` fails the issue path. That way its checks run again past the
   gate. It needs a `token` secret whose events trigger workflows (not `GITHUB_TOKEN`). Whoever
   pushes new commits to a reviewed agent branch removes the label first.
 

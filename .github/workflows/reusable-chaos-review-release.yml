@@ -40,7 +40,7 @@ on:
         description: >-
           Login that authors the agent's pull requests (an app's `<slug>[bot]`). An owner's label on an issue is applied
           to a pull request only when exactly one open same-repository agent-branch pull request by this login closes
-          the issue. Empty: the issue path does nothing.
+          that issue and no other. Required for the issue path: empty fails the run there.
         required: false
         type: string
         default: ''
@@ -102,7 +102,8 @@ jobs:
             # checks that label against the pull request's head like any other. Nothing is re-derived later.
             [[ "$ISSUE" =~ ^[0-9]+$ ]] || { echo "no issue number"; exit 1; }
             say() { gh issue comment "$ISSUE" -R "$REPO" --body "$1" >/dev/null; echo "$1"; }
-            [ -n "$AGENT_AUTHOR" ] || { echo "agent_author is not set: the issue path is off"; exit 0; }
+            # Fail closed: without agent_author the issue path cannot tell the agent's pull request from anyone else's.
+            [ -n "$AGENT_AUTHOR" ] || { echo "::error::agent_author is not set: refusing to move an issue label"; exit 1; }
             # When the owner applied the label (server time): the newest such event on the issue, by the owner.
             labeled_at=$(gh api "repos/$REPO/issues/$ISSUE/events" --paginate \
               --jq ".[] | select(.event == \"labeled\" and .label.name == \"$LABEL\" and .actor.login == \"$OWNER\") | .created_at" | tail -n 1)
@@ -113,7 +114,7 @@ jobs:
               --json number,headRefName,headRefOid,isCrossRepository,author,closingIssuesReferences \
               --jq ".[] | select(.isCrossRepository | not) | select(.headRefName | startswith(\"$PREFIX\"))
                     | select(.author.login == \"$AGENT_AUTHOR\" or .author.login == \"$slug\" or .author.login == \"app/$slug\")
-                    | select([.closingIssuesReferences[].number] | index($ISSUE)) | [.number, .headRefName, .headRefOid] | @tsv")
+                    | select([.closingIssuesReferences[].number] == [$ISSUE]) | [.number, .headRefName, .headRefOid] | @tsv")
             count=$(grep -c . <<<"$matches" || true)
             if [ "$count" != 1 ]; then
               say "'$LABEL' on this issue matches $count open agent pull requests, so it was not applied to any. Apply '$LABEL' to the pull request you reviewed."
@@ -141,6 +142,13 @@ jobs:
               exit 0
             fi
             gh pr edit "$pr" -R "$REPO" --add-label "$LABEL" >/dev/null
+            # The head must not have moved while the label was being applied: the approval is for the head checked above.
+            now_sha=$(gh pr view "$pr" -R "$REPO" --json headRefOid --jq .headRefOid)
+            if [ "$now_sha" != "$head_sha" ]; then
+              gh pr edit "$pr" -R "$REPO" --remove-label "$LABEL" >/dev/null || true
+              say "'$LABEL' was taken off #$pr again: the pull request moved (${head_sha:0:7} -> ${now_sha:0:7}) while it was being approved. Label the pull request again after reviewing its new head."
+              exit 0
+            fi
             echo "applied '$LABEL' to #$pr (reviewed through #$ISSUE); its own labeled event releases it"
             exit 0
           fi
