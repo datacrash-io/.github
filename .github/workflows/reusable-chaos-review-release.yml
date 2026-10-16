@@ -222,7 +222,7 @@ jobs:
             failed=$(gh api "repos/$REPO/commits/$head_sha/check-runs?per_page=100" \
               --jq '[.check_runs[] | select(.status == "completed" and ((.conclusion == "success" or .conclusion == "skipped" or .conclusion == "neutral") | not))] | length')
             if [ "$failed" != 0 ]; then
-              gh pr close "$PR" -R "$REPO" --comment "Reviewed by the owner; re-running the checks."
+              gh pr close "$PR" -R "$REPO" --comment "Approved by the owner. Closing and reopening only restarts the checks with the approval; this is not a rejection. Automerge takes it once they pass."
               # A Dependabot pull request left closed means "ignore this version": retry the reopen, then say so loudly.
               for attempt in 1 2 3 4 5; do
                 gh pr reopen "$PR" -R "$REPO" >/dev/null 2>&1 || true
@@ -244,6 +244,6 @@ jobs:
           pr=$PR
           # The owner's review is the single approval. Close and reopen first, so the checks start again as the owner;
           # then lift the agent's hold, last: removing it starts an automerge run, which must see the reopened checks.
-          gh pr close "$pr" -R "$REPO" --comment "Reviewed by the owner; re-running the checks."
+          gh pr close "$pr" -R "$REPO" --comment "Approved by the owner. Closing and reopening only restarts the checks with the approval; this is not a rejection. Automerge takes it once they pass."
           gh pr reopen "$pr" -R "$REPO"
           for l in $RELEASE_LABELS; do gh pr edit "$pr" -R "$REPO" --remove-label "$l" >/dev/null 2>&1 || true; done
