@@ -13,19 +13,20 @@ description: >-
 #       owner: <owner login>
 #
 # It passes when:
-#   - the event is not pull_request / pull_request_target, or
-#   - the head branch does not start with branch_prefix, or
-#   - the pull request carries `label`, read live from the API (not from the event payload), and the
-#     most recent time that label was applied, it was applied by `owner`.
+#   - neither the pull request's head branch nor the workflow's ref starts with branch_prefix, or
+#   - it is a pull_request / pull_request_target run, and all of these hold, read live from the API:
+#     the pull request carries `label`; the most recent time the label was applied, `owner` applied it;
+#     the pull request's head is still the commit this run was started for; and the label was applied
+#     after that head commit was pushed (the push time from the repository's activity log) and after
+#     its committer date. So an approval covers exactly the commit the owner saw: any later push needs
+#     the label applied again.
+# An agent branch run from any other event (push, workflow_dispatch, ...) is denied: it has no review.
 # Anything else, including an API error or a missing tool, fails the job (fail closed). It fails rather
-# than skips on purpose: a skipped check counts as passing.
-#
-# The label is the review: whoever pushes new commits to a reviewed agent branch must remove it first
-# (the agent's own publishing step does), so a review covers the commits it saw. Pair it with
+# than skips on purpose: a skipped check counts as passing. Pair it with
 # reusable-chaos-review-release.yml, which re-runs the pull request's checks when the owner applies the label.
 #
 # Token: the default github.token. A caller with a top-level `permissions:` block must grant
-# `pull-requests: read` (for agent branches only; other pull requests make no API call).
+# `pull-requests: read` and `contents: read` (used for agent branches only; other runs make no API call).
 
 inputs:
   owner:
@@ -54,20 +55,41 @@ runs:
         LABEL: ${{ inputs.label }}
         PREFIX: ${{ inputs.branch_prefix }}
         HEAD_REF: ${{ github.head_ref }}
+        REF_NAME: ${{ github.ref_name }}
         EVENT_NAME: ${{ github.event_name }}
         PR: ${{ github.event.pull_request.number }}
+        EVENT_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
       run: |
         set -uo pipefail
-        case "$EVENT_NAME" in pull_request|pull_request_target) ;; *) exit 0 ;; esac
-        [[ -n "$PREFIX" && "$HEAD_REF" == "$PREFIX"* ]] || exit 0
-        deny() { echo "::error::agent branch $HEAD_REF: $1. The owner applies '$LABEL' after reviewing the pull request."; exit 1; }
+        [[ -n "$PREFIX" ]] || exit 0
+        branch=""
+        if [[ "$HEAD_REF" == "$PREFIX"* ]]; then branch=$HEAD_REF; elif [[ "$REF_NAME" == "$PREFIX"* ]]; then branch=$REF_NAME; fi
+        [[ -n "$branch" ]] || exit 0
+        deny() { echo "::error::agent branch $branch: $1. The owner applies '$LABEL' after reviewing the pull request's current head."; exit 1; }
+        case "$EVENT_NAME" in pull_request|pull_request_target) ;; *) deny "a '$EVENT_NAME' run has no pull request review" ;; esac
+        [[ "$HEAD_REF" == "$PREFIX"* ]] || deny "the pull request's head branch is not the agent branch"
         command -v gh >/dev/null && command -v jq >/dev/null || deny "gh or jq is not installed"
-        [[ "$PR" =~ ^[0-9]+$ && -n "$OWNER" ]] || deny "no pull request number or owner"
-        labels=$(gh api "repos/$GITHUB_REPOSITORY/issues/$PR/labels" --paginate --jq '.[].name') || deny "could not read the labels"
+        [[ "$PR" =~ ^[0-9]+$ && -n "$OWNER" && "$EVENT_HEAD_SHA" =~ ^[0-9a-f]{40}$ ]] || deny "no pull request number, head commit or owner"
+        repo=$GITHUB_REPOSITORY
+
+        labels=$(gh api "repos/$repo/issues/$PR/labels" --paginate --jq '.[].name') || deny "could not read the labels"
         grep -qxF -- "$LABEL" <<<"$labels" || deny "not reviewed yet"
-        events=$(gh api "repos/$GITHUB_REPOSITORY/issues/$PR/events" --paginate \
-                   --jq '.[] | select(.event == "labeled") | [.label.name, .actor.login] | @tsv') \
+        events=$(gh api "repos/$repo/issues/$PR/events" --paginate \
+                   --jq '.[] | select(.event == "labeled") | [.label.name, .actor.login, .created_at] | @tsv') \
           || deny "could not read who applied the label"
-        by=$(awk -F'\t' -v l="$LABEL" '$1 == l { who = $2 } END { print who }' <<<"$events")
+        last=$(awk -F'\t' -v l="$LABEL" '$1 == l { who = $2; at = $3 } END { print who "\t" at }' <<<"$events")
+        by=${last%%$'\t'*}; labeled_at=${last#*$'\t'}
         [[ "$by" == "$OWNER" ]] || deny "'$LABEL' was last applied by '${by:-unknown}', not the owner"
-        echo "agent branch $HEAD_REF: reviewed ('$LABEL' applied by $by)"
+
+        # The approval is for one commit: the head now, which must be the head this run is for.
+        live=$(gh api "repos/$repo/pulls/$PR" --jq '.head.sha') || deny "could not read the pull request"
+        [[ "$live" == "$EVENT_HEAD_SHA" ]] || deny "the pull request moved on to ${live:0:7} since this run started"
+        committed_at=$(gh api "repos/$repo/commits/$live" --jq '.commit.committer.date') || deny "could not read the head commit"
+        # When that commit reached the branch: the repository activity log records each push with its server time.
+        pushed_at=$(gh api -X GET "repos/$repo/activity" -f ref="refs/heads/$branch" -f per_page=100 \
+                      --jq "[.[] | select(.after == \"$live\")] | first | .timestamp // empty") || deny "could not read the branch's push history"
+        [[ -n "$pushed_at" ]] || deny "no push of ${live:0:7} found in the activity log"
+        newer() { jq -en --arg a "$1" --arg b "$2" '($a | sub("\\.[0-9]+"; "") | fromdateiso8601) > ($b | sub("\\.[0-9]+"; "") | fromdateiso8601)' >/dev/null; }
+        newer "$labeled_at" "$pushed_at" || deny "'$LABEL' ($labeled_at) predates the push of ${live:0:7} ($pushed_at)"
+        newer "$labeled_at" "$committed_at" || deny "'$LABEL' ($labeled_at) predates head commit ${live:0:7} ($committed_at)"
+        echo "agent branch $branch: ${live:0:7} reviewed ('$LABEL' applied by $by at $labeled_at, after its push at $pushed_at)"
