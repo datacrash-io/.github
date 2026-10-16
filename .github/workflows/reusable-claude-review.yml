@@ -16,9 +16,16 @@ name: Reusable - Claude PR Review
 # Auth: Workload Identity Federation when the caller passes the anthropic_*
 # identifiers and grants `id-token: write` (no stored key: the job's GitHub OIDC
 # token is exchanged for a short-lived Anthropic token); otherwise the
-# ANTHROPIC_API_KEY secret. Every run calls the Claude API (well under a cent on
-# Haiku). The model defaults to claude-sonnet-5-5; a repo overrides it with
-# its CLAUDE_REVIEW_MODEL variable (see the model input).
+# ANTHROPIC_API_KEY secret.
+#
+# Cost: after the first review of a PR, a push is reviewed incrementally (only the
+# commits since the last reviewed head, plus the earlier review and its open threads);
+# see review.mjs for when it falls back to a full review. Incremental mode needs
+# `actions: read` and `checks: read` (to verify the earlier review): callers grant them
+# first, then the review job below requests them (README). Until then every review is
+# a full one. Every run calls the Claude
+# API (well under a cent on Haiku). The model defaults to claude-sonnet-5-5; a repo
+# overrides it with its CLAUDE_REVIEW_MODEL variable (see the model input).
 
 on:
   workflow_call:
@@ -101,8 +108,9 @@ jobs:
       !github.event.pull_request.draft &&
       !endsWith(github.event.pull_request.user.login, '[bot]')
     runs-on: ${{ inputs.runs_on }}
-    # No cancel-in-progress concurrency: a cancelled run reports as a failed
-    # check, and the automerge workflow would then refuse the PR.
+    # No concurrency group: a cancelled run reports as a failed check, which automerge
+    # refuses, and a late event for an older head could cancel the current head's run.
+    # A run whose head the PR has already left exits before the model call instead.
     timeout-minutes: 20
     steps:
       # A fork PR gets a read-only token, no id-token and no secrets: it can be neither

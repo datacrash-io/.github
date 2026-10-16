@@ -111,13 +111,26 @@ jobs:
   `hold_on` is set, so an unreviewed head never becomes mergeable; the next completed review
   lifts it. The verdict is never milder than the review's own still-open findings (an open
   high/medium means `needs changes`). Callers trigger on `synchronize` too, so every push is reviewed (automerge waits for that check on
-  the current head), and a passing review lifts a hold the review placed; a review that
+  the current head; a run for a head the PR has already left exits before calling the model), and a passing review lifts a hold the review placed; a review that
   finishes after a newer push leaves the label to the newer review. A `hold` a person
   added is never removed. **Threads:** each run re-checks the review's own open inline
   threads against the current code, resolves the fixed ones with a reply naming the commit,
   and keeps still-valid ones open without re-posting them. To dismiss a finding, reply in its
   thread with the concrete reason it's intended; the next review checks that reason against the
-  code and, if it holds, resolves the thread as accepted. A person's threads are never touched. To override, remove the label and re-run the automerge job. Never fails
+  code and, if it holds, resolves the thread as accepted. A person's threads are never touched.
+  **Incremental:** each review ends in a hidden `<!-- claude-review sha=... verdict="..." -->`
+  marker. A marker counts only when this review job's own check on that commit succeeded,
+  came from the same caller workflow calling this workflow at `main`, and recorded that it
+  posted a review. When the last such review covered an ancestor of the current head, the next run
+  reviews only the PR's files changed since that commit, with the earlier review and its open
+  threads as context, and its verdict still covers the whole PR. It reviews the whole PR again
+  when there is no marked review, after a force-push or rebase, on a re-run of the job, or when
+  the PR touches `.github/`, when any commit since the reviewed one touched `.github/`, or
+  when a changed path can't be parsed. **Enabling it takes two steps, in this order:** (1) every
+  caller adds `actions: read` and `checks: read` to its `claude-review` job's `permissions:`;
+  (2) then the `review` job here requests them too. Until step 2 the job's token can't make
+  those lookups, so every review is a full one. Doing step 2 first would stop every caller
+  that doesn't grant them from starting. To override, remove the label and re-run the automerge job. Never fails
   the check (missing key, API error, timeout), so it never blocks automerge. Authenticates
   with Workload Identity Federation when the caller passes the `anthropic_*` identifiers and
   grants `id-token: write` (no stored key), otherwise with the `ANTHROPIC_API_KEY` secret;
