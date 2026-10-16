@@ -103,9 +103,11 @@ jobs:
   default). Same-repository pull requests run CI with the repository's secrets, so put the action
   FIRST in every pull-request job that holds a secret or a write token. For an agent branch it fails
   the job until the pull request carries the review label (`chaos-reviewed`), read live from the
-  API, last applied by `owner`. Every other pull request passes without an API call. It fails
+  API, last applied by `owner`, after the current head commit was pushed: an approval covers one
+  commit, and a later push needs the label applied again. A run for an agent branch from any other
+  event (push, workflow_dispatch) is denied. Every other run passes without an API call. It fails
   rather than skips, because a skipped check counts as passing. Callers with a `permissions:` block
-  grant `pull-requests: read`. The reusable workflow, called on `pull_request: [labeled]`, closes
+  grant `pull-requests: read` and `contents: read`. The reusable workflow, called on `pull_request: [labeled]`, closes
   and reopens the pull request when the owner applies the label, so its checks run again past the
   gate. It needs a `token` secret whose events trigger workflows (not `GITHUB_TOKEN`). Whoever
   pushes new commits to a reviewed agent branch removes the label first.
