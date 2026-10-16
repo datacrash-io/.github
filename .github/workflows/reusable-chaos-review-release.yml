@@ -6,15 +6,17 @@ name: Reusable - Agent branch review release
 # every pull_request workflow runs again (on `reopened`) and passes the gate. When he applies it to an
 # issue, this applies it (with the token, as the owner) to the ONE agent pull request that closes the
 # issue, if that pull request referenced the issue and its head was pushed before the label; that
-# label event then releases it. The gate itself only ever reads the pull request's own label. It first removes `release_labels` (the agent's hold) from that pull request: the
-# owner's review label is the single approval. A label applied by anyone else does nothing here.
+# label event then releases it. The gate itself only ever reads the pull request's own label. After the
+# reopen it removes `release_labels` (the agent's hold) from that pull request, last, so the automerge run
+# that the removal starts already sees the reopened checks: the owner's review label is the single
+# approval. A label applied by anyone else does nothing here.
 # Through an issue it moves the label to exactly one pull request (see `agent_author`), never a guess.
 #
 # With `dependabot: true` it also releases a Dependabot pull request (opened by dependabot[bot] from a
 # dependabot/ branch of this repository, every commit Dependabot's own) that the owner labels, if its head
 # is the head reviewed in a `<!-- reviewed-head:<sha> -->` marker comment by `agent_author` (or the owner)
-# and was pushed before the label: it removes `release_labels`, and if a check on the head did not pass it
-# closes and reopens the pull request so the checks run again as the owner. (Re-running the failed runs
+# and was pushed before the label: if a check on the head did not pass it closes and reopens the pull request
+# so the checks run again as the owner, and then it removes `release_labels`. (Re-running the failed runs
 # instead would keep Dependabot's privileges, so a check that needs a secret would fail again.) A reopen
 # that keeps failing is retried, then reported loudly: a closed Dependabot pull request means Dependabot
 # ignores that version. Automerge then merges it as any Dependabot pull request.
@@ -213,9 +215,10 @@ jobs:
               say "'$LABEL' was not acted on: head ${head_sha:0:7} was pushed after the label (${pushed_at:-push not found}). Review the current head and apply '$LABEL' again."
               exit 0
             fi
-            for l in $RELEASE_LABELS; do gh api -X DELETE "repos/$REPO/issues/$PR/labels/$l" >/dev/null 2>&1 || true; done
             # Checks that already passed: removing the hold lets automerge merge it now. A check that failed (Dependabot's
-            # runs get no repository secrets) runs again after a close and reopen by the owner.
+            # runs get no repository secrets) runs again after a close and reopen by the owner. The hold is lifted last
+            # either way, so the automerge run its removal starts sees the reopened checks.
+            release() { for l in $RELEASE_LABELS; do gh api -X DELETE "repos/$REPO/issues/$PR/labels/$l" >/dev/null 2>&1 || true; done; }
             failed=$(gh api "repos/$REPO/commits/$head_sha/check-runs?per_page=100" \
               --jq '[.check_runs[] | select(.status == "completed" and ((.conclusion == "success" or .conclusion == "skipped" or .conclusion == "neutral") | not))] | length')
             if [ "$failed" != 0 ]; then
@@ -231,13 +234,16 @@ jobs:
                 echo "::error::#$PR could not be reopened"
                 exit 1
               fi
+              release
             else
+              release
               echo "#$PR: no failed check on ${head_sha:0:7}; the hold is lifted and automerge takes it from here"
             fi
             exit 0
           fi
           pr=$PR
-          # The owner's review is the single approval: lift the agent's hold so automerge merges once the checks pass.
-          for l in $RELEASE_LABELS; do gh pr edit "$pr" -R "$REPO" --remove-label "$l" >/dev/null 2>&1 || true; done
+          # The owner's review is the single approval. Close and reopen first, so the checks start again as the owner;
+          # then lift the agent's hold, last: removing it starts an automerge run, which must see the reopened checks.
           gh pr close "$pr" -R "$REPO" --comment "Reviewed by the owner; re-running the checks."
           gh pr reopen "$pr" -R "$REPO"
+          for l in $RELEASE_LABELS; do gh pr edit "$pr" -R "$REPO" --remove-label "$l" >/dev/null 2>&1 || true; done

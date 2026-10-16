@@ -54,7 +54,8 @@ commit messages.
   `workflow_run` list.
 - **Automerge trusts a sender, or Dependabot's own PR, never a guess.** A merge needs a
   trusted sender (the owner or `trusted_senders`) to have started the run and readied the
-  PR, or, with `merge_dependabot`, a PR that is Dependabot's end to end (author, branch,
+  PR (or a trusted user's account to have applied `review_label` after the current head was
+  pushed), or, with `merge_dependabot`, a PR that is Dependabot's end to end (author, branch,
   every commit) whose metadata lists only patch/minor updates. Any read that fails, or
   metadata it cannot parse, means "do not merge" and a green run, never a drafted PR.
   Don't loosen one of these to make a stuck PR merge; merge it by hand instead.
