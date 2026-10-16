@@ -1,0 +1,44 @@
+name: Task
+description: A feature, an improvement or maintenance work.
+labels: [enhancement]
+body:
+  - type: markdown
+    attributes:
+      value: >-
+        Title: what to do and why, e.g. "Move the settings to Postgres so the app survives a node loss".
+  - type: textarea
+    id: goal
+    attributes:
+      label: Goal
+      description: What should be true when this is done, and why. One or two sentences.
+    validations:
+      required: true
+  - type: textarea
+    id: context
+    attributes:
+      label: Context
+      description: How it works today, links, file:line.
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposal
+      description: Optional. How to do it.
+  - type: textarea
+    id: done
+    attributes:
+      label: Done when
+      description: Checkable conditions, one per line.
+      value: |
+        - [ ]
+    validations:
+      required: true
+  - type: textarea
+    id: out-of-scope
+    attributes:
+      label: Out of scope
+      description: Optional. Related work this issue does not cover.
+  - type: textarea
+    id: questions
+    attributes:
+      label: Open questions
+      description: Optional. Decisions that are still open.
