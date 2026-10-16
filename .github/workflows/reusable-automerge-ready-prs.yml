@@ -4,7 +4,8 @@
 # - pull_request (a trusted sender's ready/sync/unlabeled-hold event): merges when the
 #   checks allow it, polling or not per wait_for_pending_checks.
 # - workflow_run (a listed PR workflow finished): checks once and exits. Merges a PR a
-#   trusted sender readied, when a trusted sender started the finished run, and, with
+#   trusted sender readied (or whose current head a trusted user approved with
+#   review_label), when a trusted sender started the finished run, and, with
 #   merge_dependabot (default on), a Dependabot PR on its own: Dependabot's branch and
 #   commits only, and only patch/minor updates per its commit metadata. A major, an
 #   update with no update type, or a person's commit on the branch leaves it for a
@@ -132,6 +133,19 @@ on:
         required: false
         type: string
         default: 'hold'
+      review_label:
+        description: >-
+          On the `workflow_run` path, a PR that a trusted sender did not ready
+          (for example one an app opened) still merges when it carries this label
+          and the last time the label was applied, a trusted sender's user
+          account (never a bot or app) applied it after the PR head was pushed
+          and after its commit date. The finished run must still have been
+          started by a trusted sender. Read live; any read that fails means "do
+          not merge". Same label as reusable-chaos-review-release.yml. Empty
+          turns this off.
+        required: false
+        type: string
+        default: 'chaos-reviewed'
     secrets:
       AUTOMERGE_TOKEN:
         description: >-
@@ -208,6 +222,7 @@ jobs:
           RUN_TRIGGERING_ACTOR: ${{ github.event.workflow_run.triggering_actor.login }}
           TRUSTED: ${{ inputs.trusted_senders }}
           MERGE_DEPENDABOT: ${{ inputs.merge_dependabot }}
+          REVIEW_LABEL: ${{ inputs.review_label }}
         run: |
           set -euo pipefail
 
@@ -352,9 +367,53 @@ jobs:
             return 0
           }
 
+          # A PR a trusted sender did not ready (an app's) may merge when a trusted
+          # sender reviewed its current head: it carries review_label, and the last
+          # time that label was applied, a trusted sender's user account (not a bot
+          # or app) applied it after the head was pushed (the repository activity
+          # log) and after the head's commit date. Sets $review_note when a read
+          # fails or the label does not qualify. Any failure means "not reviewed".
+          reviewed_head() {
+            local labels events last by kind at head_ref pushed_at committed_at
+            local err="$RUNNER_TEMP/review-error.txt"
+            review_note=""
+            [ -n "$REVIEW_LABEL" ] || return 1
+            if ! labels=$(gh api "repos/$REPO/issues/$number/labels" --paginate --jq '.[].name' 2> "$err"); then
+              review_note="could not read the labels of PR #$number"; return 1
+            fi
+            grep -qxF -- "$REVIEW_LABEL" <<<"$labels" || return 1
+            if ! events=$(gh api "repos/$REPO/issues/$number/events" --paginate \
+                --jq '.[] | select(.event == "labeled") | [.label.name, .actor.login, .actor.type, .created_at] | @tsv' 2> "$err"); then
+              review_note="could not read who applied '$REVIEW_LABEL'"; return 1
+            fi
+            last=$(awk -F'\t' -v l="$REVIEW_LABEL" '$1 == l { r = $2 "\t" $3 "\t" $4 } END { print r }' <<<"$events")
+            IFS=$'\t' read -r by kind at <<<"$last"
+            if [ "$kind" != "User" ] || [[ "$by" == *"[bot]" ]] || ! is_trusted "$by"; then
+              review_note="'$REVIEW_LABEL' was last applied by '${by:-unknown}' (${kind:-unknown}), not a trusted user"; return 1
+            fi
+            head_ref=$(jq -r '.headRefName // empty' <<<"$pr")
+            if ! [[ "$head_sha" =~ ^[0-9a-f]{40}$ ]] || [ -z "$head_ref" ]; then
+              review_note="no head commit or branch for PR #$number"; return 1
+            fi
+            if ! pushed_at=$(gh api -X GET "repos/$REPO/activity" -f ref="refs/heads/$head_ref" -f per_page=100 \
+                --jq "[.[] | select(.after == \"$head_sha\")] | first | .timestamp // empty" 2> "$err") || [ -z "$pushed_at" ]; then
+              review_note="no push of ${head_sha:0:7} found in the activity log"; return 1
+            fi
+            if ! committed_at=$(gh api "repos/$REPO/commits/$head_sha" --jq '.commit.committer.date' 2> "$err") || [ -z "$committed_at" ]; then
+              review_note="could not read head commit ${head_sha:0:7}"; return 1
+            fi
+            newer() { jq -en --arg a "$1" --arg b "$2" '($a | sub("\\.[0-9]+"; "") | fromdateiso8601) > ($b | sub("\\.[0-9]+"; "") | fromdateiso8601)' >/dev/null; }
+            if ! newer "$at" "$pushed_at" || ! newer "$at" "$committed_at"; then
+              review_note="'$REVIEW_LABEL' ($at) predates the push of ${head_sha:0:7} ($pushed_at) or its commit date ($committed_at)"; return 1
+            fi
+            echo "PR #$number: head ${head_sha:0:7} reviewed ('$REVIEW_LABEL' applied by $by at $at, after its push at $pushed_at)."
+            return 0
+          }
+
           skip=""
           dependabot=false
           why=""
+          review_note=""
           if [ "$state" != "OPEN" ]; then
             skip="PR #$number is $state"
           elif [ "$draft" = "true" ]; then
@@ -363,6 +422,8 @@ jobs:
             skip="PR #$number has moved on to $head_sha; that commit's own checks will re-trigger this"
           elif is_trusted "$RUN_ACTOR" && is_trusted "$RUN_TRIGGERING_ACTOR" && is_trusted "$readied_by"; then
             : # the ordinary path: a trusted sender started the run and readied the PR
+          elif is_trusted "$RUN_ACTOR" && is_trusted "$RUN_TRIGGERING_ACTOR" && reviewed_head; then
+            : # a trusted sender started the run and reviewed the current head (review_label)
           elif [ "$MERGE_DEPENDABOT" != "true" ]; then
             if is_trusted "$RUN_ACTOR" && is_trusted "$RUN_TRIGGERING_ACTOR"; then
               skip="PR #$number was made ready by '$readied_by', who is not a trusted sender"
@@ -375,6 +436,7 @@ jobs:
             skip="$why"
           fi
           if [ -n "$skip" ]; then
+            [ -z "$review_note" ] || skip="$skip; not reviewed either: $review_note"
             echo "$skip -- not merging."
             echo "proceed=false" >> "$GITHUB_OUTPUT"
             exit 0

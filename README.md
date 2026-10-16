@@ -15,6 +15,9 @@ Shared GitHub Actions workflows for datacrash-io repositories.
   `true` (poll and wait) while callers are moved over. A finished run only starts a merge
   when a trusted sender (the owner account or `trusted_senders`) started it and its head is
   in this repository. Each run answers for one PR head and stops once the PR has moved on.
+  A PR that a trusted sender did not ready (one an app opened) also merges once a trusted
+  user's account applied `review_label` (default `chaos-reviewed`) after its current head
+  was pushed; a later push needs the label applied again.
 
   **Dependabot PRs merge on their own** (`merge_dependabot`, default `true`; set `false` to
   merge them by hand). On the `workflow_run` path a run Dependabot started is let through,
