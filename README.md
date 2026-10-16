@@ -118,6 +118,14 @@ jobs:
   the label is applied, the label is taken off again. An empty `agent_author` fails the issue path. That way its checks run again past the
   gate. It needs a `token` secret whose events trigger workflows (not `GITHUB_TOKEN`). Whoever
   pushes new commits to a reviewed agent branch removes the label first.
+  With `dependabot: true` it also releases a Dependabot pull request of the repository (author
+  `dependabot[bot]`, a `dependabot/` branch, every commit Dependabot's own and signed) that the owner
+  labels, for repositories that keep those on `hold` until someone has reviewed them. Its head must be
+  the one named in the newest `<!-- reviewed-head:<sha> -->` comment by `agent_author` (or the owner) and
+  must have been pushed before the label. It then removes `release_labels`, and when a check on that head
+  did not pass it closes and reopens the pull request so the checks run again as the owner (re-running
+  the failed runs would keep Dependabot's privileges). A reopen that keeps failing is retried and then
+  reported on the pull request. Automerge then merges it as any Dependabot pull request.
 
 ```yaml
 jobs:

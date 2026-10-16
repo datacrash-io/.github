@@ -10,6 +10,15 @@ name: Reusable - Agent branch review release
 # owner's review label is the single approval. A label applied by anyone else does nothing here.
 # Through an issue it moves the label to exactly one pull request (see `agent_author`), never a guess.
 #
+# With `dependabot: true` it also releases a Dependabot pull request (opened by dependabot[bot] from a
+# dependabot/ branch of this repository, every commit Dependabot's own) that the owner labels, if its head
+# is the head reviewed in a `<!-- reviewed-head:<sha> -->` marker comment by `agent_author` (or the owner)
+# and was pushed before the label: it removes `release_labels`, and if a check on the head did not pass it
+# closes and reopens the pull request so the checks run again as the owner. (Re-running the failed runs
+# instead would keep Dependabot's privileges, so a check that needs a secret would fail again.) A reopen
+# that keeps failing is retried, then reported loudly: a closed Dependabot pull request means Dependabot
+# ignores that version. Automerge then merges it as any Dependabot pull request.
+#
 # No checkout and no pull request code: two gh calls. It needs a token whose events trigger workflows
 # (a personal access token or an app token with pull-requests write); events made with GITHUB_TOKEN
 # do not start other workflows.
@@ -59,6 +68,16 @@ on:
         required: false
         type: string
         default: chaos/
+      dependabot:
+        description: >-
+          Also release a Dependabot pull request of this repository (author dependabot[bot], head branch
+          dependabot/...) when the owner applies the label to it, for repositories that hold Dependabot pull
+          requests for review instead of merging them right away. Needs `agent_author`: the head must be
+          the one named in that login's (or the owner's) newest `<!-- reviewed-head:<sha> -->` comment.
+          Default false: agent branches only.
+        required: false
+        type: boolean
+        default: false
       runs_on:
         description: Runner label for the job.
         required: false
@@ -78,7 +97,9 @@ jobs:
       && github.actor == inputs.owner && github.triggering_actor == inputs.owner
       && github.event.sender.login == inputs.owner
       && ((github.event_name == 'pull_request' && startsWith(github.head_ref, inputs.branch_prefix))
-          || github.event_name == 'issues')
+          || github.event_name == 'issues'
+          || (inputs.dependabot && github.event_name == 'pull_request' && startsWith(github.head_ref, 'dependabot/')
+              && github.event.pull_request.user.login == 'dependabot[bot]'))
     runs-on: ${{ inputs.runs_on }}
     timeout-minutes: 5
     steps:
@@ -87,6 +108,8 @@ jobs:
           GH_TOKEN: ${{ secrets.token }}
           EVENT_NAME: ${{ github.event_name }}
           PR: ${{ github.event.pull_request.number }}
+          HEAD_REF: ${{ github.head_ref }}
+          DEPENDABOT: ${{ inputs.dependabot }}
           ISSUE: ${{ github.event.issue.number }}
           PREFIX: ${{ inputs.branch_prefix }}
           AGENT_AUTHOR: ${{ inputs.agent_author }}
@@ -150,6 +173,67 @@ jobs:
               exit 0
             fi
             echo "applied '$LABEL' to #$pr (reviewed through #$ISSUE); its own labeled event releases it"
+            exit 0
+          fi
+          if [ "$EVENT_NAME" = pull_request ] && [[ "$HEAD_REF" != "$PREFIX"* ]]; then
+            # A Dependabot pull request the owner reviewed. Read live: the job's `if` only saw the event payload.
+            [ "$DEPENDABOT" = true ] && [[ "$HEAD_REF" == dependabot/* && "$PR" =~ ^[0-9]+$ ]] || { echo "not a pull request this releases"; exit 0; }
+            say() { gh api "repos/$REPO/issues/$PR/comments" -f body="$1" >/dev/null; echo "$1"; }
+            info=$(gh api "repos/$REPO/pulls/$PR" --jq '[.user.login, .user.type, (.head.repo.full_name // ""), .head.ref, .head.sha, .state] | @tsv')
+            IFS=$'\t' read -r author kind head_repo head_ref head_sha state <<<"$info"
+            if [ "$author $kind" != "dependabot[bot] Bot" ] || [ "$head_repo" != "$REPO" ] || [[ "$head_ref" != dependabot/* ]] || [ "$state" != open ]; then
+              echo "#$PR is not an open Dependabot pull request of $REPO: nothing to release"; exit 0
+            fi
+            # Every commit Dependabot's own: authored by dependabot[bot], committed through the API (web-flow) or by it,
+            # and signed. A person's push makes it an ordinary pull request.
+            commits=$(gh api --paginate "repos/$REPO/pulls/$PR/commits?per_page=100" \
+              --jq '.[] | [(.author.login // "-"), (.committer.login // "-"), (.commit.verification.verified | tostring)] | @tsv')
+            if [ -z "$commits" ] || awk -F'\t' '$1 != "dependabot[bot]" || ($2 != "web-flow" && $2 != "dependabot[bot]") || $3 != "true" { bad = 1 } END { exit !bad }' <<<"$commits"; then
+              say "'$LABEL' was not acted on: #$PR has commits that are not Dependabot's own."
+              exit 0
+            fi
+            # The approval binds to the head that was reviewed: the newest marker by the reviewer (or the owner).
+            [ -n "$AGENT_AUTHOR" ] || { echo "::error::agent_author is not set: refusing to release a Dependabot pull request"; exit 1; }
+            reviewed=$(gh api "repos/$REPO/issues/$PR/comments" --paginate \
+              --jq ".[] | select(.user.login == \"$AGENT_AUTHOR\" or .user.login == \"$OWNER\") | .body" \
+              | grep -oE '<!-- reviewed-head:[0-9a-f]{40} -->' | tail -n 1 | grep -oE '[0-9a-f]{40}' || true)
+            if [ "$reviewed" != "$head_sha" ]; then
+              note=${reviewed:+the review was of ${reviewed:0:7}}
+              say "'$LABEL' was not acted on: head ${head_sha:0:7} is not the reviewed head (${note:-no review found}). It needs a new review."
+              exit 0
+            fi
+            labeled_at=$(gh api "repos/$REPO/issues/$PR/events" --paginate \
+              --jq ".[] | select(.event == \"labeled\" and .label.name == \"$LABEL\" and .actor.login == \"$OWNER\") | .created_at" | tail -n 1)
+            [ -n "$labeled_at" ] || { echo "no '$LABEL' by the owner on #$PR"; exit 0; }
+            before() { jq -en --arg a "$1" --arg b "$2" '($a | sub("\\.[0-9]+"; "") | fromdateiso8601) < ($b | sub("\\.[0-9]+"; "") | fromdateiso8601)' >/dev/null; }
+            # The approval is for the head the owner saw: it must have been pushed before the label.
+            pushed_at=$(gh api -X GET "repos/$REPO/activity" -f ref="refs/heads/$head_ref" -f per_page=100 \
+              --jq "[.[] | select(.after == \"$head_sha\")] | first | .timestamp // empty")
+            if [ -z "$pushed_at" ] || ! before "$pushed_at" "$labeled_at"; then
+              say "'$LABEL' was not acted on: head ${head_sha:0:7} was pushed after the label (${pushed_at:-push not found}). Review the current head and apply '$LABEL' again."
+              exit 0
+            fi
+            for l in $RELEASE_LABELS; do gh api -X DELETE "repos/$REPO/issues/$PR/labels/$l" >/dev/null 2>&1 || true; done
+            # Checks that already passed: removing the hold lets automerge merge it now. A check that failed (Dependabot's
+            # runs get no repository secrets) runs again after a close and reopen by the owner.
+            failed=$(gh api "repos/$REPO/commits/$head_sha/check-runs?per_page=100" \
+              --jq '[.check_runs[] | select(.status == "completed" and ((.conclusion == "success" or .conclusion == "skipped" or .conclusion == "neutral") | not))] | length')
+            if [ "$failed" != 0 ]; then
+              gh pr close "$PR" -R "$REPO" --comment "Reviewed by the owner; re-running the checks."
+              # A Dependabot pull request left closed means "ignore this version": retry the reopen, then say so loudly.
+              for attempt in 1 2 3 4 5; do
+                gh pr reopen "$PR" -R "$REPO" >/dev/null 2>&1 || true
+                [ "$(gh api "repos/$REPO/pulls/$PR" --jq .state 2>/dev/null || true)" = open ] && break
+                sleep $((attempt * 5))
+              done
+              if [ "$(gh api "repos/$REPO/pulls/$PR" --jq .state 2>/dev/null || true)" != open ]; then
+                say "@$OWNER this Dependabot pull request was closed to re-run its checks and could NOT be reopened. Reopen it by hand: while it stays closed, Dependabot treats this version as ignored."
+                echo "::error::#$PR could not be reopened"
+                exit 1
+              fi
+            else
+              echo "#$PR: no failed check on ${head_sha:0:7}; the hold is lifted and automerge takes it from here"
+            fi
             exit 0
           fi
           pr=$PR
