@@ -119,13 +119,18 @@ jobs:
   thread with the concrete reason it's intended; the next review checks that reason against the
   code and, if it holds, resolves the thread as accepted. A person's threads are never touched.
   **Incremental:** each review ends in a hidden `<!-- claude-review sha=... verdict="..." -->`
-  marker. A marker counts only when this review job's own check concluded success on that
-  commit (needs `actions: read` and `checks: read` from the caller; without them every review
-  is full). When the last such review covered an ancestor of the current head, the next run
+  marker. A marker counts only when this review job's own check on that commit succeeded,
+  came from the same caller workflow calling this workflow at `main`, and recorded that it
+  posted a review. When the last such review covered an ancestor of the current head, the next run
   reviews only the PR's files changed since that commit, with the earlier review and its open
   threads as context, and its verdict still covers the whole PR. It reviews the whole PR again
   when there is no marked review, after a force-push or rebase, on a re-run of the job, or when
-  the PR touches `.github/`, or a changed path it can't parse. To override, remove the label and re-run the automerge job. Never fails
+  the PR touches `.github/`, when any commit since the reviewed one touched `.github/`, or
+  when a changed path can't be parsed. **Enabling it takes two steps, in this order:** (1) every
+  caller adds `actions: read` and `checks: read` to its `claude-review` job's `permissions:`;
+  (2) then the `review` job here requests them too. Until step 2 the job's token can't make
+  those lookups, so every review is a full one. Doing step 2 first would stop every caller
+  that doesn't grant them from starting. To override, remove the label and re-run the automerge job. Never fails
   the check (missing key, API error, timeout), so it never blocks automerge. Authenticates
   with Workload Identity Federation when the caller passes the `anthropic_*` identifiers and
   grants `id-token: write` (no stored key), otherwise with the `ANTHROPIC_API_KEY` secret;

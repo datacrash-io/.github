@@ -20,9 +20,10 @@ name: Reusable - Claude PR Review
 #
 # Cost: after the first review of a PR, a push is reviewed incrementally (only the
 # commits since the last reviewed head, plus the earlier review and its open threads);
-# see review.mjs for when it falls back to a full review. Incremental mode needs the
-# caller to grant `actions: read` and `checks: read` (to verify the earlier review);
-# without them every review is a full one. Every run calls the Claude
+# see review.mjs for when it falls back to a full review. Incremental mode needs
+# `actions: read` and `checks: read` (to verify the earlier review): callers grant them
+# first, then the review job below requests them (README). Until then every review is
+# a full one. Every run calls the Claude
 # API (well under a cent on Haiku). The model defaults to claude-sonnet-5-5; a repo
 # overrides it with its CLAUDE_REVIEW_MODEL variable (see the model input).
 

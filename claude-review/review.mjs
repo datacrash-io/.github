@@ -208,10 +208,17 @@ function replyToThread(threadId, reply) {
 // touches .github/.
 // The marker alone is never trusted: every workflow a same-repo PR adds posts as the
 // same bot, so a PR could post a marker for a commit nobody reviewed. A marker counts
-// only when this review job's own check (same check name, run by GitHub Actions, from a
-// pull_request run of the same caller workflow file) concluded success on exactly that
-// commit. Those lookups need `actions: read` and `checks: read`; without them every
-// review is a full one. Every head still gets a model call.
+// only when this review job's own check (same check name, run by GitHub Actions) on
+// exactly that commit concluded success, belongs to a pull_request run of the same
+// caller workflow file that called this reusable workflow at main, and carries the
+// COMPLETED_TITLE annotation, which this script writes only after posting a review (a
+// run that exited because the PR moved on is green too, but has none). A PR that edits
+// workflows can still fake all of that at some commit, so any commit since the marked
+// one that touched .github/ also means a full review. Those lookups need `actions: read`
+// and `checks: read`; without them every review is a full one. Every head still gets a
+// model call.
+const COMPLETED_TITLE = "Claude review completed";
+const REUSABLE = "datacrash-io/.github/.github/workflows/reusable-claude-review.yml@main";
 const RANK = ["looks good", "minor issues", "needs changes"];
 const marker = (sha, verdict) => `<!-- claude-review sha=${sha} verdict="${verdict}" -->`;
 // Anchored to the end of the body: the model writes the text before it, so a marker it was
@@ -258,16 +265,29 @@ function ownCheck() {
   return path ? { name: mine[0].name, path } : null;
 }
 
-// True only when this review job's check concluded success on exactly `sha`.
+// True only when a run of this review job posted a completed review of exactly `sha`.
 function reviewedByThisJob(sha, own) {
   const ids = JSON.parse(gh(["api", `repos/${REPO}/commits/${sha}/check-runs?check_name=${encodeURIComponent(own.name)}&filter=all&per_page=100`,
     "--jq", `[.check_runs[] | select(.app.slug == "github-actions" and .conclusion == "success" and .head_sha == "${sha}") | .id]`]));
   for (const id of ids) {
-    const runId = gh(["api", `repos/${REPO}/actions/jobs/${id}`, "--jq", ".run_id"]).trim();
-    const run = JSON.parse(gh(["api", `repos/${REPO}/actions/runs/${runId}`, "--jq", "{path, event, head_sha}"]));
-    if (run.path === own.path && run.event === "pull_request" && run.head_sha === sha) return true;
+    const job = JSON.parse(gh(["api", `repos/${REPO}/actions/jobs/${id}`, "--jq", "{run_id, head_sha}"]));
+    if (job.head_sha !== sha) continue;
+    const run = JSON.parse(gh(["api", `repos/${REPO}/actions/runs/${job.run_id}`,
+      "--jq", "{path, event, head_sha, refs: [.referenced_workflows[]?.path]}"]));
+    if (run.path !== own.path || run.event !== "pull_request" || run.head_sha !== sha || !run.refs.includes(REUSABLE)) continue;
+    const done = Number(gh(["api", `repos/${REPO}/check-runs/${id}/annotations?per_page=100`,
+      "--jq", `[.[] | select(.title == "${COMPLETED_TITLE}" and .message == "Reviewed ${sha}")] | length`]).trim());
+    if (done > 0) return true;
   }
   return false;
+}
+
+// True when any commit in from..head touched .github/, even if a later one reverted it.
+function rangeTouchesSensitive(from) {
+  const shas = gh(["api", `repos/${REPO}/compare/${from}...${env.HEAD_SHA}`, "--jq", ".commits[].sha"]).split("\n").filter(Boolean);
+  if (shas.length === 0 || shas.length > 100) return true; // can't check them all: treat as touched
+  return shas.some((c) => gh(["api", `repos/${REPO}/commits/${c}`, "--paginate", "--jq", ".files[].filename"])
+    .split("\n").filter(Boolean).some(SENSITIVE));
 }
 
 // Returns { from, verdict, body, diff } for an incremental review, or { reason } for a full one.
@@ -284,6 +304,7 @@ function planIncremental(fullDiff) {
   if (prev.sha === env.HEAD_SHA) return { from: prev.sha, verdict: prev.verdict, body: prev.body, diff: "" };
   const status = gh(["api", `repos/${REPO}/compare/${prev.sha}...${env.HEAD_SHA}`, "--jq", ".status"]).trim();
   if (status !== "ahead") return { reason: `the last reviewed commit ${prev.sha.slice(0, 7)} is not an ancestor of head (${status}): force-push or rebase` };
+  if (rangeTouchesSensitive(prev.sha)) return { reason: `a commit since ${prev.sha.slice(0, 7)} touched .github/` };
   // Only the PR's own files: a merge of the base branch brings in changes main already reviewed.
   const diff = diffForFiles(gh(["api", "-H", "Accept: application/vnd.github.diff", `repos/${REPO}/compare/${prev.sha}...${env.HEAD_SHA}`]), files);
   if (diff === null) return { reason: "the changes since the last review have a path it can't parse" };
@@ -564,6 +585,8 @@ ${reviewDiff}
     }
   }
   output(toResolve);
+  // Read back by reviewedByThisJob: proof that this check posted a real review of HEAD_SHA.
+  if (env.HEAD_SHA) console.log(`::notice title=${COMPLETED_TITLE}::Reviewed ${env.HEAD_SHA}`);
   console.log(`${toResolve.length} fixed thread(s) to resolve, ${stillOpen.length} still open.`);
   console.log(`Posted review: ${review.verdict}, ${review.findings.length} finding(s), ${inline.length} inline${cost}`);
 }
