@@ -1,0 +1,73 @@
+name: Agent branch review gate
+description: >-
+  Fails the job for a pull request from an automated agent's branch (head branch starting with
+  branch_prefix) until the repository owner has applied the review label. Every other pull request,
+  and every other event, passes without an API call.
+
+# Same-repository pull requests run their CI with the repository's secrets. A branch pushed by an
+# unattended agent is unreviewed code, so a job that holds a secret or a write token puts this action
+# FIRST, before any checkout:
+#
+#   - uses: datacrash-io/.github/actions/chaos-guard@main
+#     with:
+#       owner: <owner login>
+#
+# It passes when:
+#   - the event is not pull_request / pull_request_target, or
+#   - the head branch does not start with branch_prefix, or
+#   - the pull request carries `label`, read live from the API (not from the event payload), and the
+#     most recent time that label was applied, it was applied by `owner`.
+# Anything else, including an API error or a missing tool, fails the job (fail closed). It fails rather
+# than skips on purpose: a skipped check counts as passing.
+#
+# The label is the review: whoever pushes new commits to a reviewed agent branch must remove it first
+# (the agent's own publishing step does), so a review covers the commits it saw. Pair it with
+# reusable-chaos-review-release.yml, which re-runs the pull request's checks when the owner applies the label.
+#
+# Token: the default github.token. A caller with a top-level `permissions:` block must grant
+# `pull-requests: read` (for agent branches only; other pull requests make no API call).
+
+inputs:
+  owner:
+    description: Login whose application of the review label releases the gate.
+    required: true
+  label:
+    description: The review label.
+    required: false
+    default: chaos-reviewed
+  branch_prefix:
+    description: Head branches starting with this are gated.
+    required: false
+    default: chaos/
+  token:
+    description: Token for the API reads.
+    required: false
+    default: ${{ github.token }}
+
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.token }}
+        OWNER: ${{ inputs.owner }}
+        LABEL: ${{ inputs.label }}
+        PREFIX: ${{ inputs.branch_prefix }}
+        HEAD_REF: ${{ github.head_ref }}
+        EVENT_NAME: ${{ github.event_name }}
+        PR: ${{ github.event.pull_request.number }}
+      run: |
+        set -uo pipefail
+        case "$EVENT_NAME" in pull_request|pull_request_target) ;; *) exit 0 ;; esac
+        [[ -n "$PREFIX" && "$HEAD_REF" == "$PREFIX"* ]] || exit 0
+        deny() { echo "::error::agent branch $HEAD_REF: $1. The owner applies '$LABEL' after reviewing the pull request."; exit 1; }
+        command -v gh >/dev/null && command -v jq >/dev/null || deny "gh or jq is not installed"
+        [[ "$PR" =~ ^[0-9]+$ && -n "$OWNER" ]] || deny "no pull request number or owner"
+        labels=$(gh api "repos/$GITHUB_REPOSITORY/issues/$PR/labels" --paginate --jq '.[].name') || deny "could not read the labels"
+        grep -qxF -- "$LABEL" <<<"$labels" || deny "not reviewed yet"
+        events=$(gh api "repos/$GITHUB_REPOSITORY/issues/$PR/events" --paginate \
+                   --jq '.[] | select(.event == "labeled") | [.label.name, .actor.login] | @tsv') \
+          || deny "could not read who applied the label"
+        by=$(awk -F'\t' -v l="$LABEL" '$1 == l { who = $2 } END { print who }' <<<"$events")
+        [[ "$by" == "$OWNER" ]] || deny "'$LABEL' was last applied by '${by:-unknown}', not the owner"
+        echo "agent branch $HEAD_REF: reviewed ('$LABEL' applied by $by)"

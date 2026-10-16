@@ -98,6 +98,31 @@ jobs:
         if: steps.tested.outputs.tested != 'true'
 ```
 
+- `actions/chaos-guard` (a composite action) and `.github/workflows/reusable-chaos-review-release.yml`:
+  a review gate for pull requests from an automated agent's branches (head branch `chaos/` by
+  default). Same-repository pull requests run CI with the repository's secrets, so put the action
+  FIRST in every pull-request job that holds a secret or a write token. For an agent branch it fails
+  the job until the pull request carries the review label (`chaos-reviewed`), read live from the
+  API, last applied by `owner`. Every other pull request passes without an API call. It fails
+  rather than skips, because a skipped check counts as passing. Callers with a `permissions:` block
+  grant `pull-requests: read`. The reusable workflow, called on `pull_request: [labeled]`, closes
+  and reopens the pull request when the owner applies the label, so its checks run again past the
+  gate. It needs a `token` secret whose events trigger workflows (not `GITHUB_TOKEN`). Whoever
+  pushes new commits to a reviewed agent branch removes the label first.
+
+```yaml
+jobs:
+  build:
+    permissions:
+      contents: read
+      pull-requests: read
+    steps:
+      - uses: datacrash-io/.github/actions/chaos-guard@main
+        with:
+          owner: <owner login>
+      - uses: actions/checkout@<sha>
+```
+
 - `.github/workflows/reusable-claude-review.yml`: advisory PR review run by
   `claude-review/review.mjs` on the Claude Agent SDK: one review with inline comments. Not
   `anthropics/claude-code-action`, because that runs Claude Code, which API credits granted with

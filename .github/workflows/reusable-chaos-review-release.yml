@@ -1,0 +1,71 @@
+name: Reusable - Agent branch review release
+
+# The other half of actions/chaos-guard: that action fails every secret-bearing job of a pull request
+# from an agent branch until the owner applies the review label. When the owner applies it, this
+# closes and reopens the pull request, so every pull_request workflow runs again (on `reopened`) and
+# passes the gate. A label applied by anyone else does nothing here.
+#
+# No checkout and no pull request code: two gh calls. It needs a token whose events trigger workflows
+# (a personal access token or an app token with pull-requests write); events made with GITHUB_TOKEN
+# do not start other workflows.
+#
+# Caller:
+#   on:
+#     pull_request:
+#       types: [labeled]
+#   jobs:
+#     release:
+#       if: github.event.label.name == 'chaos-reviewed'
+#       uses: datacrash-io/.github/.github/workflows/reusable-chaos-review-release.yml@main
+#       with:
+#         owner: <owner login>
+#       secrets:
+#         token: ${{ secrets.<TOKEN> }}
+
+on:
+  workflow_call:
+    inputs:
+      owner:
+        description: Login whose application of the label releases the gate. Any other sender is ignored.
+        required: true
+        type: string
+      label:
+        description: The review label (same as the chaos-guard action's).
+        required: false
+        type: string
+        default: chaos-reviewed
+      branch_prefix:
+        description: Head branches starting with this are agent branches.
+        required: false
+        type: string
+        default: chaos/
+      runs_on:
+        description: Runner label for the job.
+        required: false
+        type: string
+        default: 'datacrash-io-arc'
+    secrets:
+      token:
+        description: Token used to close and reopen the pull request (its events must trigger workflows).
+        required: true
+
+permissions: {}
+
+jobs:
+  rerun:
+    if: >-
+      github.event_name == 'pull_request' && github.event.action == 'labeled'
+      && github.event.label.name == inputs.label && startsWith(github.head_ref, inputs.branch_prefix)
+      && github.actor == inputs.owner && github.triggering_actor == inputs.owner
+      && github.event.sender.login == inputs.owner
+    runs-on: ${{ inputs.runs_on }}
+    timeout-minutes: 5
+    steps:
+      - name: Close and reopen the pull request so its checks run past the gate
+        env:
+          GH_TOKEN: ${{ secrets.token }}
+          PR: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+        run: |
+          gh pr close "$PR" -R "$REPO" --comment "Reviewed by the owner; re-running the checks."
+          gh pr reopen "$PR" -R "$REPO"
