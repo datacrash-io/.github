@@ -1,0 +1,46 @@
+name: Bug
+description: Something is broken or behaves wrongly.
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: >-
+        Title: what is wrong and where, e.g. "GET /api/chat/session without an id answers 500 instead of 404".
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What happens, and what should happen instead. One or two sentences.
+    validations:
+      required: true
+  - type: textarea
+    id: context
+    attributes:
+      label: Context
+      description: How to reproduce, links, file:line, log lines, error ids.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposal
+      description: Optional. A likely cause or fix, if known.
+  - type: textarea
+    id: done
+    attributes:
+      label: Done when
+      description: Checkable conditions, one per line, e.g. "the request answers 404" or "a test covers it".
+      value: |
+        - [ ]
+    validations:
+      required: true
+  - type: textarea
+    id: out-of-scope
+    attributes:
+      label: Out of scope
+      description: Optional. Related work this issue does not cover.
+  - type: textarea
+    id: questions
+    attributes:
+      label: Open questions
+      description: Optional. Decisions that are still open.
