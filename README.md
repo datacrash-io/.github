@@ -103,17 +103,18 @@ jobs:
   default). Same-repository pull requests run CI with the repository's secrets, so put the action
   FIRST in every pull-request job that holds a secret or a write token. For an agent branch it fails
   the job until the pull request carries the review label (`chaos-reviewed`), read live from the
-  API, last applied there by `owner`, after the current head commit was pushed. The label on an
-  issue the pull request closes counts too, but only for a same-repository pull request opened by
-  `agent_author` (an app's `<slug>[bot]`) that is the one open pull request closing that issue: an approval covers one
+  API, last applied by `owner`, after the current head commit was pushed: an approval covers one
   commit, and a later push needs the label applied again. A run for an agent branch from any other
   event (push, workflow_dispatch) is denied. Every other run passes without an API call. It fails
   rather than skips, because a skipped check counts as passing. Callers with a `permissions:` block
-  grant `pull-requests: read`, `issues: read` and `contents: read`. The reusable workflow, called on `pull_request: [labeled]` and
-  `issues: [labeled]`, closes and reopens the pull request (for an issue: each open agent pull request
-  that closes it) when the owner applies the label, after removing `release_labels`
-  (default `hold chaos-agent`) from it. Through an issue it releases exactly one pull request: with
-  more than one match it releases none and comments on the issue, so its checks run again past the
+  grant `pull-requests: read` and `contents: read`. The reusable workflow, called on `pull_request: [labeled]`, removes
+  `release_labels` (default `hold chaos-agent`: the owner's label is the single approval), then closes
+  and reopens the pull request when the owner applies the label. Called on `issues: [labeled]` as
+  well, it moves an owner's label on an issue to the ONE open same-repository agent-branch pull
+  request by `agent_author` that closes the issue, applying it to that pull request with the token
+  (as the owner). It does this only if that pull request referenced the issue, and its current head
+  was pushed, before the label was applied. The pull-request label event then releases it as above.
+  With no match, or more than one, it changes nothing and comments on the issue. That way its checks run again past the
   gate. It needs a `token` secret whose events trigger workflows (not `GITHUB_TOKEN`). Whoever
   pushes new commits to a reviewed agent branch removes the label first.
 
