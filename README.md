@@ -107,8 +107,14 @@ jobs:
   commit, and a later push needs the label applied again. A run for an agent branch from any other
   event (push, workflow_dispatch) is denied. Every other run passes without an API call. It fails
   rather than skips, because a skipped check counts as passing. Callers with a `permissions:` block
-  grant `pull-requests: read` and `contents: read`. The reusable workflow, called on `pull_request: [labeled]`, closes
-  and reopens the pull request when the owner applies the label, so its checks run again past the
+  grant `pull-requests: read` and `contents: read`. The reusable workflow, called on `pull_request: [labeled]`, removes
+  `release_labels` (default `hold chaos-agent`: the owner's label is the single approval), then closes
+  and reopens the pull request when the owner applies the label. Called on `issues: [labeled]` as
+  well, it moves an owner's label on an issue to the ONE open same-repository agent-branch pull
+  request by `agent_author` that closes the issue, applying it to that pull request with the token
+  (as the owner). It does this only if that pull request referenced the issue, and its current head
+  was pushed, before the label was applied. The pull-request label event then releases it as above.
+  With no match, or more than one, it changes nothing and comments on the issue. That way its checks run again past the
   gate. It needs a `token` secret whose events trigger workflows (not `GITHUB_TOKEN`). Whoever
   pushes new commits to a reviewed agent branch removes the label first.
 
