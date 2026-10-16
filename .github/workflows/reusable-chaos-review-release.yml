@@ -4,7 +4,9 @@ name: Reusable - Agent branch review release
 # from an agent branch until the owner applies the review label, on the pull request or on an issue it
 # closes. When the owner applies it, this closes and reopens the pull request (for an issue: every open
 # agent pull request that closes it), so every pull_request workflow runs again (on `reopened`) and
-# passes the gate. A label applied by anyone else does nothing here.
+# passes the gate. It first removes `release_labels` (the agent's hold) from that pull request: the
+# owner's review label is the single approval. A label applied by anyone else does nothing here.
+# Through an issue it releases exactly one pull request (see `agent_author`), never a guess.
 #
 # No checkout and no pull request code: two gh calls. It needs a token whose events trigger workflows
 # (a personal access token or an app token with pull-requests write); events made with GITHUB_TOKEN
@@ -32,6 +34,19 @@ on:
         description: Login whose application of the label releases the gate. Any other sender is ignored.
         required: true
         type: string
+      agent_author:
+        description: >-
+          Login that authors the agent's pull requests (an app's `<slug>[bot]`, same as the chaos-guard input). An issue
+          label releases a pull request only when exactly one open same-repository agent-branch pull request by this
+          login closes the issue. Empty: the issue path does nothing.
+        required: false
+        type: string
+        default: ''
+      release_labels:
+        description: Labels removed from the released pull request, so automerge can merge it once its checks pass.
+        required: false
+        type: string
+        default: 'hold chaos-agent'
       label:
         description: The review label (same as the chaos-guard action's).
         required: false
@@ -72,19 +87,36 @@ jobs:
           PR: ${{ github.event.pull_request.number }}
           ISSUE: ${{ github.event.issue.number }}
           PREFIX: ${{ inputs.branch_prefix }}
+          AGENT_AUTHOR: ${{ inputs.agent_author }}
+          RELEASE_LABELS: ${{ inputs.release_labels }}
+          LABEL: ${{ inputs.label }}
           REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
           if [ "$EVENT_NAME" = pull_request ]; then
-            prs=$PR
+            pr=$PR
           else
-            # The label on an issue: every open agent pull request (head branch with the prefix) that closes it.
+            # The label on an issue releases exactly ONE pull request: the open same-repository agent-branch pull request
+            # by agent_author that closes it. None: nothing to do. More than one: nothing is released, and the issue says
+            # to label the pull request itself.
             [[ "$ISSUE" =~ ^[0-9]+$ ]] || { echo "no issue number"; exit 1; }
-            prs=$(gh pr list -R "$REPO" --state open --limit 100 --json number,headRefName,closingIssuesReferences \
-              --jq ".[] | select(.headRefName | startswith(\"$PREFIX\")) | select([.closingIssuesReferences[].number] | index($ISSUE)) | .number")
+            [ -n "$AGENT_AUTHOR" ] || { echo "agent_author is not set: the issue path is off"; exit 0; }
+            # gh shows an app author as `app/<slug>`, the REST API as `<slug>[bot]`: accept the forms of one login.
+            slug=${AGENT_AUTHOR%\[bot\]}
+            matches=$(gh pr list -R "$REPO" --state open --limit 200 \
+              --json number,headRefName,isCrossRepository,author,closingIssuesReferences \
+              --jq ".[] | select(.isCrossRepository | not) | select(.headRefName | startswith(\"$PREFIX\"))
+                    | select(.author.login == \"$AGENT_AUTHOR\" or .author.login == \"$slug\" or .author.login == \"app/$slug\")
+                    | select([.closingIssuesReferences[].number] | index($ISSUE)) | .number")
+            count=$(grep -c . <<<"$matches" || true)
+            if [ "$count" = 0 ]; then echo "no open agent pull request closes #$ISSUE"; exit 0; fi
+            if [ "$count" != 1 ]; then
+              gh issue comment "$ISSUE" -R "$REPO" --body "'$LABEL' on this issue matches $count open agent pull requests ($(tr '\n' ' ' <<<"$matches" | sed 's/ $//' | sed 's/\([0-9][0-9]*\)/#\1/g')), so none was released. Apply '$LABEL' to the pull request you reviewed instead."
+              exit 0
+            fi
+            pr=$matches
           fi
-          [ -n "$prs" ] || { echo "no open agent pull request closes #$ISSUE"; exit 0; }
-          for n in $prs; do
-            gh pr close "$n" -R "$REPO" --comment "Reviewed by the owner; re-running the checks."
-            gh pr reopen "$n" -R "$REPO"
-          done
+          # The owner's review is the single approval: lift the agent's hold so automerge merges once the checks pass.
+          for l in $RELEASE_LABELS; do gh pr edit "$pr" -R "$REPO" --remove-label "$l" >/dev/null 2>&1 || true; done
+          gh pr close "$pr" -R "$REPO" --comment "Reviewed by the owner; re-running the checks."
+          gh pr reopen "$pr" -R "$REPO"

@@ -16,7 +16,8 @@ description: >-
 #   - neither the pull request's head branch nor the workflow's ref starts with branch_prefix, or
 #   - it is a pull_request / pull_request_target run, and all of these hold, read live from the API:
 #     the pull request, or an issue in this repository that the pull request closes (the owner may review from the
-#     issue), carries `label`; the most recent time the label was applied there, `owner` applied it;
+#     issue; only for a same-repository pull request opened by `agent_author`, and only when it is the ONE open pull
+#     request closing that issue, so the label releases exactly the pull request the owner saw), carries `label`; the most recent time the label was applied there, `owner` applied it;
 #     the pull request's head is still the commit this run was started for; and the label was applied
 #     after that head commit was pushed (the push time from the repository's activity log) and after
 #     its committer date. So an approval covers exactly the commit the owner saw: any later push needs
@@ -33,6 +34,13 @@ inputs:
   owner:
     description: Login whose application of the review label releases the gate.
     required: true
+  agent_author:
+    description: >-
+      Login that authors the agent's pull requests (an app's `<slug>[bot]`). The review label on an issue counts only
+      for a pull request this login opened. Empty disables approval through an issue (the label must be on the pull
+      request).
+    required: false
+    default: ''
   label:
     description: The review label.
     required: false
@@ -60,6 +68,7 @@ runs:
         EVENT_NAME: ${{ github.event_name }}
         PR: ${{ github.event.pull_request.number }}
         EVENT_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        AGENT_AUTHOR: ${{ inputs.agent_author }}
       run: |
         set -uo pipefail
         [[ -n "$PREFIX" ]] || exit 0
@@ -107,17 +116,41 @@ runs:
         # 1. The label on the pull request itself.
         a=$(approval "$PR") || deny "could not read the pull request's labels or events"
         [[ -n "$a" ]] && accept "pull request #$PR" "$a"
-        # 2. The label on an issue the pull request closes, in this repository (the owner reviews from the issue).
+        # 2. The label on an issue the pull request closes, in this repository (the owner reviews from the issue). An
+        #    issue label must release exactly the one pull request the owner saw: this pull request must be the agent's
+        #    (same repository, agent branch, opened by agent_author), and the only open pull request closing that issue.
+        if [[ -z "$AGENT_AUTHOR" ]]; then
+          (( ${#reasons[@]} )) && deny "$(IFS=';'; echo "${reasons[*]}")"
+          deny "not reviewed yet (no '$LABEL' on the pull request; approval through an issue is off: no agent_author)"
+        fi
+        pr_meta=$(gh api "repos/$repo/pulls/$PR" --jq '[.user.login, .head.repo.full_name] | @tsv') || deny "could not read the pull request"
+        author=${pr_meta%%$'\t'*}; head_repo=${pr_meta#*$'\t'}
+        lrepo=$(tr '[:upper:]' '[:lower:]' <<<"$repo")
+        issue_ok=true
+        if [[ "$author" != "$AGENT_AUTHOR" ]]; then reasons+=("issue approval is only for the agent's pull requests (author '$author')"); issue_ok=false; fi
+        if [[ "$(tr '[:upper:]' '[:lower:]' <<<"$head_repo")" != "$lrepo" ]]; then reasons+=("issue approval is only for same-repository pull requests"); issue_ok=false; fi
         closing=$(gh api graphql -F n="$PR" -f o="${repo%%/*}" -f r="${repo#*/}" \
           -f query='query($o: String!, $r: String!, $n: Int!) { repository(owner: $o, name: $r) { pullRequest(number: $n) {
             closingIssuesReferences(first: 10) { nodes { number repository { nameWithOwner } } } } } }' \
           --jq '.data.repository.pullRequest.closingIssuesReferences.nodes[] | [.repository.nameWithOwner, .number] | @tsv') \
           || deny "could not read the issues the pull request closes"
-        lrepo=$(tr '[:upper:]' '[:lower:]' <<<"$repo")
-        while IFS=$'\t' read -r cr cn; do
+        # Every open pull request with the issues it closes (same repository), to check the approval is unambiguous.
+        open_prs=""
+        if $issue_ok; then
+          open_prs=$(gh pr list -R "$repo" --state open --limit 200 --json number,closingIssuesReferences \
+            --jq '.[] | [.number, ([.closingIssuesReferences[].number] | map(tostring) | join(" "))] | @tsv') \
+            || deny "could not list the open pull requests"
+        fi
+        while $issue_ok && IFS=$'\t' read -r cr cn; do
           [[ -n "$cn" && "$(tr '[:upper:]' '[:lower:]' <<<"$cr")" == "$lrepo" && "$cn" =~ ^[0-9]+$ ]] || continue
           a=$(approval "$cn") || deny "could not read the labels or events of issue #$cn"
-          [[ -n "$a" ]] && accept "issue #$cn" "$a"
+          [[ -n "$a" ]] || continue
+          closers=$(awk -F'\t' -v n="$cn" '{ split($2, xs, " "); for (i in xs) if (xs[i] == n) { print $1; break } }' <<<"$open_prs")
+          if [[ "$(grep -c . <<<"$closers")" != 1 || "$closers" != "$PR" ]]; then
+            reasons+=("issue approval is ambiguous: $(grep -c . <<<"$closers") open pull requests close #$cn ($(tr '\n' ' ' <<<"$closers"| sed 's/ $//')); label the pull request itself")
+            continue
+          fi
+          accept "issue #$cn" "$a"
         done <<<"$closing"
         (( ${#reasons[@]} )) && deny "$(IFS=';'; echo "${reasons[*]}")"
         deny "not reviewed yet (no '$LABEL' on the pull request or on an issue it closes)"
