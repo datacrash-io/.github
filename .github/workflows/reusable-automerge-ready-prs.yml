@@ -141,14 +141,16 @@ on:
           the same point and with the same rules (a failed read means no merge).
           Default: the Claude review's labels for a head that is not clean,
           `review:minor,review:changes,review:missing` (reusable-claude-review.yml,
-          label_mode review). `review:lgtm` should never be listed. A PR with no
+          label_mode review), plus `review:owner` (waits for the owner: set here when
+          GitHub refuses to merge a workflow change, and by automation on PRs a person
+          must approve). `review:lgtm` should never be listed. A PR with no
           review label at all is not blocked by that: required_check_workflows
           already waits for the review's check on the current head. Drop
           `review:minor` for a repository that lets minor findings merge (and its
           review's hold_on to match), or pass '' to turn this off.
         required: false
         type: string
-        default: 'review:minor,review:changes,review:missing'
+        default: 'review:minor,review:changes,review:missing,review:owner'
       draft_on_failure:
         description: >-
           When a merge attempt fails (a check failed, a conflict), leave the PR
@@ -801,6 +803,10 @@ jobs:
             done
           fi
           if grep -q 'without .workflows. permission' "$RUNNER_TEMP/merge-error.txt" 2>/dev/null; then
+            # Hand it to a person visibly: `review:owner` ("waits for the owner"), which boards and humans can see,
+            # instead of a comment alone on a PR that otherwise looks ready.
+            gh label create review:owner --repo "$REPO" --color 5319E7 --description "Waits for the owner" --force >/dev/null 2>&1 || true
+            gh api --method POST "repos/$REPO/issues/$PR_NUMBER/labels" -f "labels[]=review:owner" >/dev/null 2>&1 || true
             gh pr comment "$PR_NUMBER" --repo "$REPO" --body-file - <<'BODY'
           **Merge this one by hand** — re-marking it ready will not help.
 

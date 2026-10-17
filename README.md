@@ -27,7 +27,7 @@ Shared GitHub Actions workflows for datacrash-io repositories.
   someone marks it ready. A PR carrying `hold_label` or a blocking label is never drafted.
 
   **Labels that stop a merge:** `hold_label` (default `hold`) and every label in
-  `blocking_labels` (comma-separated, default `review:minor,review:changes,review:missing`,
+  `blocking_labels` (comma-separated, default `review:minor,review:changes,review:missing,review:owner`,
   the Claude review's labels for a head that is not clean). Both are read once every check has
   finished, right before the merge, and a failed read means no merge. `review:lgtm` never
   blocks, and a PR with no review label is not blocked by that alone: `required_check_workflows`
