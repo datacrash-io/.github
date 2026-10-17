@@ -1,8 +1,9 @@
 # Merges a ready PR once every other check on its head has passed and every other
 # pull_request run of that head has completed, then dispatches post_merge_workflows.
 #
-# - pull_request (a trusted sender's ready/sync/unlabeled-hold event): merges when the
-#   checks allow it, polling or not per wait_for_pending_checks.
+# - pull_request (a trusted sender's ready/sync event, or one removing hold_label or a
+#   blocking label): merges when the checks allow it, polling or not per
+#   wait_for_pending_checks.
 # - workflow_run (a listed PR workflow finished): checks once and exits. Merges a PR a
 #   trusted sender readied (or whose current head a trusted user approved with
 #   review_label), when a trusted sender started the finished run, and, with
@@ -30,7 +31,7 @@ on:
         type: boolean
         default: false
       required_check_workflows:
-        description: "JSON array of workflow names that must have reported a check on the PR before it can merge. Default: the Claude review, whose check can lag the others; without it, a fix push could see every other check green and read the previous review's hold before that push's review had even started. '[]' for a repo without it."
+        description: "JSON array of workflow names that must have reported a check on the PR before it can merge. Default: the Claude review, whose check can lag the others; without it, a fix push could see every other check green and read the previous review's label before that push's review had even started. '[]' for a repo without it."
         required: false
         type: string
         default: '["Security & Review"]'
@@ -113,7 +114,8 @@ on:
           dependabot/fetch-metadata reads); a major, or metadata that is missing
           or cannot be read, is left for a person and the run exits green. All the
           usual gates still apply: every check green, nothing pending, no hold
-          label, the merge pinned to the head, post_merge_workflows dispatched.
+          or blocking label, the merge pinned to the head, post_merge_workflows
+          dispatched.
           GitHub may refuse a GITHUB_TOKEN merge of a bump that changes
           `.github/workflows/`; the run then logs that it needs AUTOMERGE_TOKEN
           and leaves the PR as it is. Set false to merge Dependabot PRs by hand.
@@ -133,6 +135,20 @@ on:
         required: false
         type: string
         default: 'hold'
+      blocking_labels:
+        description: >-
+          Comma-separated labels that stop a merge just like hold_label, read at
+          the same point and with the same rules (a failed read means no merge).
+          Default: the Claude review's labels for a head that is not clean,
+          `review:minor,review:changes,review:missing` (reusable-claude-review.yml,
+          label_mode review). `review:lgtm` should never be listed. A PR with no
+          review label at all is not blocked by that: required_check_workflows
+          already waits for the review's check on the current head. Drop
+          `review:minor` for a repository that lets minor findings merge (and its
+          review's hold_on to match), or pass '' to turn this off.
+        required: false
+        type: string
+        default: 'review:minor,review:changes,review:missing'
       draft_on_failure:
         description: >-
           When a merge attempt fails (a check failed, a conflict), leave the PR
@@ -140,7 +156,8 @@ on:
           push or finished check run retries the merge on its own. Set true to
           move it back to draft instead, so it waits until someone marks it
           ready again. Either way a PR carrying
-          hold_label is left as it is, since it was never meant to merge yet.
+          hold_label or a blocking label is left as it is, since it was never
+          meant to merge yet.
         required: false
         type: boolean
         default: false
@@ -199,7 +216,8 @@ jobs:
     # Every other run is skipped here, before a runner is requested.
     if: >-
       (github.event_name == 'pull_request' && github.event.pull_request.draft == false && (github.event.sender.login == '3h4x' || contains(fromJSON(inputs.trusted_senders), github.event.sender.login))
-        && (github.event.action != 'unlabeled' || github.event.label.name == inputs.hold_label))
+        && (github.event.action != 'unlabeled' || github.event.label.name == inputs.hold_label
+          || contains(format(',{0},', inputs.blocking_labels), format(',{0},', github.event.label.name))))
       || (github.event_name == 'workflow_run' && (github.event.workflow_run.event == 'pull_request' || github.event.workflow_run.event == 'pull_request_target')
         && github.event.workflow_run.head_repository.full_name == github.repository
         && (((github.event.workflow_run.actor.login == '3h4x' || contains(fromJSON(inputs.trusted_senders), github.event.workflow_run.actor.login))
@@ -483,12 +501,21 @@ jobs:
           ALLOW_NO_CHECKS: ${{ inputs.allow_merge_with_no_checks }}
           WAIT_FOR_PENDING: ${{ github.event_name == 'pull_request' && inputs.wait_for_pending_checks }}
           HOLD_LABEL: ${{ inputs.hold_label }}
+          BLOCKING_LABELS: ${{ inputs.blocking_labels }}
           DEPENDABOT: ${{ steps.pr.outputs.dependabot }}
           HAS_AUTOMERGE_TOKEN: ${{ secrets.AUTOMERGE_TOKEN != '' }}
         run: |
           set -euo pipefail
 
           NO_CHECKS_GRACE_ATTEMPTS=4
+
+          # blocking_labels, split on commas and trimmed.
+          blocking=()
+          IFS=',' read -r -a raw_blocking <<< "$BLOCKING_LABELS"
+          for l in ${raw_blocking[@]+"${raw_blocking[@]}"}; do
+            l="${l#"${l%%[![:space:]]*}"}"; l="${l%"${l##*[![:space:]]}"}"
+            if [ -n "$l" ]; then blocking+=("$l"); fi
+          done
 
           base_merge_args=(--"$MERGE_STRATEGY" --delete-branch)
           merge_args=("${base_merge_args[@]}")
@@ -674,6 +701,13 @@ jobs:
                 echo "### Not merged: PR #$PR_NUMBER is on \`$HOLD_LABEL\`" >> "$GITHUB_STEP_SUMMARY"
                 exit 0
               fi
+              for l in ${blocking[@]+"${blocking[@]}"}; do
+                if grep -qxF -- "$l" <<< "$labels"; then
+                  echo "::notice::PR #$PR_NUMBER has the blocking label '$l' -- not merging. A fix push re-runs this after its review; removing the label re-runs it too."
+                  echo "### Not merged: PR #$PR_NUMBER carries \`$l\`" >> "$GITHUB_STEP_SUMMARY"
+                  exit 0
+                fi
+              done
               if [ "$total" -eq 0 ]; then
                 echo "No checks ever appeared, but allow_merge_with_no_checks is set for this repo -- merging."
               else
@@ -738,16 +772,23 @@ jobs:
           PR_NUMBER: ${{ steps.pr.outputs.number }}
           HEAD_SHA: ${{ steps.pr.outputs.head_sha }}
           HOLD_LABEL: ${{ inputs.hold_label }}
+          BLOCKING_LABELS: ${{ inputs.blocking_labels }}
           DRAFT_ON_FAILURE: ${{ inputs.draft_on_failure }}
           REPO: ${{ github.repository }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
-          # A held PR was not going to merge anyway: leave it ready and quiet. If the labels
-          # cannot be read, fall through to the usual handling.
-          if [ -n "$HOLD_LABEL" ] && labels=$(gh pr view "$PR_NUMBER" --repo "$REPO" --json labels --jq '.labels[].name') \
-              && grep -qxF "$HOLD_LABEL" <<<"$labels"; then
-            echo "PR #$PR_NUMBER carries '$HOLD_LABEL': left as it is."
-            exit 0
+          # A held PR, or one with a blocking label, was not going to merge anyway: leave it
+          # ready and quiet. If the labels cannot be read, fall through to the usual handling.
+          if labels=$(gh pr view "$PR_NUMBER" --repo "$REPO" --json labels --jq '.labels[].name'); then
+            IFS=',' read -r -a stoppers <<< "$BLOCKING_LABELS"
+            stoppers+=("$HOLD_LABEL")
+            for l in "${stoppers[@]}"; do
+              l="${l#"${l%%[![:space:]]*}"}"; l="${l%"${l##*[![:space:]]}"}"
+              if [ -n "$l" ] && grep -qxF -- "$l" <<<"$labels"; then
+                echo "PR #$PR_NUMBER carries '$l': left as it is."
+                exit 0
+              fi
+            done
           fi
           if grep -q 'without .workflows. permission' "$RUNNER_TEMP/merge-error.txt" 2>/dev/null; then
             gh pr comment "$PR_NUMBER" --repo "$REPO" --body-file - <<'BODY'

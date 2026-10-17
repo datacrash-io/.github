@@ -11,12 +11,14 @@
 // posts them.
 //
 // Never fails the caller's check (automerge treats red as a refusal): every error ends
-// in a ::warning:: and exit 0. With hold_on set, an error also holds the PR (failClosed).
+// in a ::warning:: and exit 0. An error labels the PR review:missing (label_mode review),
+// or holds it when hold_on is set (label_mode hold): failClosed.
 
 import { query } from "@anthropic-ai/claude-agent-sdk";
 import { execFileSync } from "node:child_process";
 import { mkdirSync, writeFileSync, rmSync, realpathSync, appendFileSync } from "node:fs";
 import { join, resolve, sep } from "node:path";
+import { REVIEW_LABELS, parseLabelMode, parseHoldOn, planReviewLabels, holdAction, blocks } from "./labels.mjs";
 
 const env = process.env;
 const REPO = env.REPO;
@@ -27,7 +29,8 @@ const MAX_BUDGET_USD = Number(env.MAX_BUDGET_USD || 1);
 const EXTRA = env.EXTRA_INSTRUCTIONS || "";
 const MAX_DIFF_CHARS = 150_000;
 const HOLD_LABEL = env.HOLD_LABEL || "hold";
-const HOLD_ON = (env.HOLD_ON ?? "needs changes").split(",").map((v) => v.trim().toLowerCase()).filter(Boolean);
+const HOLD_ON = parseHoldOn(env.HOLD_ON);
+const LABEL_MODE = parseLabelMode(env.LABEL_MODE);
 const BOT = "github-actions[bot]";
 
 // Every credential the job holds. The agent's output is checked against these before
@@ -151,8 +154,9 @@ const SCHEMA = {
 
 // The hold label stops the shared automerge workflow. The review only ever removes a
 // hold it placed itself, never one a person added.
+const prLabels = () => JSON.parse(gh(["api", `repos/${REPO}/issues/${PR}/labels`])).map((l) => l.name);
 function holdState() {
-  const labels = JSON.parse(gh(["api", `repos/${REPO}/issues/${PR}/labels`])).map((l) => l.name);
+  const labels = prLabels();
   const lastBy = gh(["api", `repos/${REPO}/issues/${PR}/events`, "--paginate",
     "--jq", `.[] | select(.event == "labeled" and .label.name == "${HOLD_LABEL}") | .actor.login`]).trim().split("\n").pop();
   return { held: labels.includes(HOLD_LABEL), byReview: lastBy === BOT };
@@ -314,12 +318,35 @@ function planIncremental(fullDiff) {
 
 const currentHead = () => JSON.parse(gh(["pr", "view", PR, "--repo", REPO, "--json", "headRefOid"])).headRefOid;
 const addHold = () => gh(["api", "--method", "POST", `repos/${REPO}/issues/${PR}/labels`, "--input", "-"], JSON.stringify({ labels: [HOLD_LABEL] }));
+const removeLabel = (name) => gh(["api", "--method", "DELETE", `repos/${REPO}/issues/${PR}/labels/${encodeURIComponent(name)}`]);
 
-// A gate that opens when the reviewer breaks isn't a gate: when hold_on is set and this
-// run reviewed the current head, a review that can't finish holds the PR. The next
+// label_mode review: leave exactly one review:* label on the PR, the one for this verdict
+// (null = no review ran). The label is created with its colour and description if the
+// repository lacks it; --force with both given never re-colours it at random.
+function applyReviewLabel(verdict, current = prLabels()) {
+  const plan = planReviewLabels(current, verdict);
+  if (plan.add) {
+    try {
+      gh(["label", "create", plan.label.name, "--repo", REPO, "--force", "--color", plan.label.color, "--description", plan.label.description]);
+    } catch (e) {
+      warn(`Could not create or update the ${plan.label.name} label`, e.message); // adding it below still works
+    }
+    gh(["api", "--method", "POST", `repos/${REPO}/issues/${PR}/labels`, "--input", "-"], JSON.stringify({ labels: [plan.label.name] }));
+    console.log(`Added the ${plan.label.name} label (${verdict ? `verdict: ${verdict}` : "no review"}).`);
+  }
+  for (const name of plan.remove) {
+    removeLabel(name);
+    console.log(`Removed the ${name} label an earlier review set.`);
+  }
+}
+
+// A gate that opens when the reviewer breaks isn't a gate: in label_mode hold, when hold_on
+// is set and this run reviewed the current head, a review that can't finish holds the PR
+// (label_mode review sets review:missing instead, see failClosedReviewLabel). The next
 // completed review lifts that hold; a person can remove it sooner.
 function failClosed(title, reason) {
   warn(title, reason);
+  if (LABEL_MODE === "review") return failClosedReviewLabel(title);
   if (HOLD_ON.length === 0) return;
   try {
     if (env.HEAD_SHA && currentHead() !== env.HEAD_SHA) return; // the newer push's review decides
@@ -334,12 +361,34 @@ function failClosed(title, reason) {
   }
 }
 
-function applyHold(hold, before, verdict) {
-  if (hold && !before.held) {
+// label_mode review: a review that can't finish leaves review:missing on the current head
+// (whatever hold_on says: the PR always carries one review:* label). It comments when it
+// sets the label; a run that finds the label already there stays quiet.
+function failClosedReviewLabel(title) {
+  const missing = REVIEW_LABELS.missing.name;
+  try {
+    if (env.HEAD_SHA && currentHead() !== env.HEAD_SHA) return; // the newer push's review decides
+    const current = prLabels();
+    const already = current.includes(missing);
+    applyReviewLabel(null, current);
+    if (already) return;
+    const effect = blocks(null, HOLD_ON)
+      ? "automerge won't merge this PR until a review of its head completes"
+      : "no review of this head has completed";
+    gh(["api", "--method", "POST", `repos/${REPO}/issues/${PR}/comments`, "--input", "-"], JSON.stringify({
+      body: `:no_entry: **Claude review could not complete** (${title.toLowerCase()}). Added \`${missing}\`: ${effect}. Push again or re-run the review job.`,
+    }));
+  } catch (e) {
+    warn(`Could not set ${missing} after a failed review`, e.message);
+  }
+}
+
+function applyHold(action, verdict) {
+  if (action === "add") {
     addHold();
     console.log(`Added the ${HOLD_LABEL} label (verdict: ${verdict}).`);
-  } else if (!hold && before.held && before.byReview) {
-    gh(["api", "--method", "DELETE", `repos/${REPO}/issues/${PR}/labels/${encodeURIComponent(HOLD_LABEL)}`]);
+  } else if (action === "remove") {
+    removeLabel(HOLD_LABEL);
     console.log(`Removed the ${HOLD_LABEL} label the review had added (verdict: ${verdict}).`);
   }
 }
@@ -519,14 +568,25 @@ ${reviewDiff}
   }
   const hold = HOLD_ON.includes(review.verdict);
   const before = holdState();
+  const action = holdAction({ mode: LABEL_MODE, verdict: review.verdict, holdOn: HOLD_ON, held: before.held, byReview: before.byReview });
   const head = currentHead();
   const stale = Boolean(env.HEAD_SHA) && head !== env.HEAD_SHA;
+  const verdictLabel = REVIEW_LABELS[review.verdict];
+  // Any hold on the PR: one the review placed is lifted by a verdict outside hold_on (in
+  // label_mode review too, so a PR held before the switch is released), one a person
+  // added stays.
+  const holdLine = action === "remove" ? `\nThis verdict lifts the \`${HOLD_LABEL}\` label an earlier review added.`
+    : before.held && !before.byReview ? `\nThe \`${HOLD_LABEL}\` label stays: a person added it, so only a person removes it.` : "";
+  const reviewLabelNote = hold
+    ? `\n:no_entry: Added \`${verdictLabel.name}\`: automerge won't merge this PR until a re-review lifts it. Push a fix and the review runs again.`
+    : review.verdict === "looks good" ? `\n:white_check_mark: Added \`${verdictLabel.name}\` (${verdictLabel.description}).`
+    : `\nAdded \`${verdictLabel.name}\` (${verdictLabel.description}). The review of a fix push replaces it.`;
   const holdNote = stale
-    ? `\n_A newer push arrived while this ran; its own review decides the \`${HOLD_LABEL}\` label._`
+    ? `\n_A newer push arrived while this ran; its own review decides the \`${LABEL_MODE === "review" ? "review:*" : HOLD_LABEL}\` label._`
+    : LABEL_MODE === "review" ? reviewLabelNote + holdLine
     : hold
     ? `\n:no_entry: ${before.held ? `Stays on \`${HOLD_LABEL}\`` : `Added the \`${HOLD_LABEL}\` label`}: automerge won't merge this PR. Push a fix and the review runs again and lifts it when the verdict allows, or remove the label yourself and re-run the automerge job.`
-    : before.held && before.byReview ? `\nThis verdict lifts the \`${HOLD_LABEL}\` label an earlier review added.`
-    : before.held ? `\nThe \`${HOLD_LABEL}\` label stays: a person added it, so only a person removes it.` : "";
+    : holdLine;
   const valid = commentableLines(diff);
   const inline = [];
   const elsewhere = [];
@@ -550,7 +610,9 @@ ${reviewDiff}
     truncated ? `\n_The diff was longer than ${MAX_DIFF_CHARS} characters; only the first part was reviewed._` : "",
     previousNote,
     // The repo's policy, not this PR's state: the label line above says what happened.
-    `\n<sub>Review by ${MODEL}${cost}. ${HOLD_ON.length ? `Hold policy: a verdict of ${HOLD_ON.join(" or ")} holds the PR.` : "Advisory only, never holds a PR."}</sub>`,
+    `\n<sub>Review by ${MODEL}${cost}. ${LABEL_MODE === "review"
+      ? "Sets one `review:*` label per reviewed head; the repository's automerge settings decide which labels block a merge."
+      : HOLD_ON.length ? `Hold policy: a verdict of ${HOLD_ON.join(" or ")} holds the PR.` : "Advisory only, never holds a PR."}</sub>`,
     env.HEAD_SHA ? marker(env.HEAD_SHA, review.verdict) : "",
   ].filter(Boolean).join("\n");
 
@@ -568,8 +630,11 @@ ${reviewDiff}
   // label; a review overtaken by a newer push leaves it alone (that one decides, and if
   // it fails, failClosed holds the PR).
   if (stale) {
-    console.log(`PR moved on to ${head.slice(0, 7)} since this review started; leaving the ${HOLD_LABEL} label to that push's review.`);
-  } else applyHold(hold, before, review.verdict);
+    console.log(`PR moved on to ${head.slice(0, 7)} since this review started; leaving the labels to that push's review.`);
+  } else {
+    if (LABEL_MODE === "review") applyReviewLabel(review.verdict);
+    applyHold(action, review.verdict);
+  }
   // Resolve fixed threads only from a review of the current head; a stale review's
   // "fixed" could describe code a newer push changed again.
   const toResolve = [];

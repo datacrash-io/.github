@@ -22,7 +22,15 @@ Shared GitHub Actions workflows for datacrash-io repositories.
   When a merge attempt fails, the PR stays ready by default (`draft_on_failure`, default
   `false`): it gets one comment per head commit, and the next push or finished check run
   retries the merge. With `draft_on_failure: true` it is moved back to draft and waits until
-  someone marks it ready. A PR carrying `hold_label` is never drafted.
+  someone marks it ready. A PR carrying `hold_label` or a blocking label is never drafted.
+
+  **Labels that stop a merge:** `hold_label` (default `hold`) and every label in
+  `blocking_labels` (comma-separated, default `review:minor,review:changes,review:missing`,
+  the Claude review's labels for a head that is not clean). Both are read once every check has
+  finished, right before the merge, and a failed read means no merge. `review:lgtm` never
+  blocks, and a PR with no review label is not blocked by that alone: `required_check_workflows`
+  already waits for the review's check on the current head. A repository that lets minor
+  findings merge drops `review:minor` here (and from its review's `hold_on`); `''` turns it off.
 
   **Dependabot PRs merge on their own** (`merge_dependabot`, default `true`; set `false` to
   merge them by hand). On the `workflow_run` path a run Dependabot started is let through,
@@ -32,7 +40,7 @@ Shared GitHub Actions workflows for datacrash-io repositories.
   `semver-minor` update. A major, an entry with no update type (a Docker digest-only bump,
   an indirect security update), or a person's commit on the branch leaves the PR for a
   person, with the reason in the run log; the run stays green and the PR is not drafted.
-  Every other gate (checks, unfinished runs, `hold`, the pinned head, `post_merge_workflows`)
+  Every other gate (checks, unfinished runs, `hold` and blocking labels, the pinned head, `post_merge_workflows`)
   is the same as for any PR, so the merge deploys as usual. GitHub may refuse a
   `GITHUB_TOKEN` merge of a bump that changes `.github/workflows/`; the run then logs that
   it needs an `AUTOMERGE_TOKEN` secret with the `workflow` scope and leaves the PR ready.
@@ -153,16 +161,33 @@ jobs:
   `anthropics/claude-code-action`, because that runs Claude Code, which API credits granted with
   a Claude plan don't cover. The agent reads the repo but has no shell and no GitHub token; the
   script posts its findings. Inputs: `model` (empty = claude-sonnet-5-5; callers pass `vars.CLAUDE_REVIEW_MODEL`), `max_turns`, `max_budget_usd` (default 1),
-  `extra_instructions`, `hold_on`, `hold_label`.
-  **Hold:** when the verdict is in `hold_on` (default `needs changes`; add `minor issues` for a
-  stricter repo), the review adds the `hold` label, which the automerge workflow refuses to
-  merge. A PR from a fork fails this check (it can be neither reviewed nor held), so automerge
-  refuses it. A review that can't finish (API error, timeout, no credential) also holds the PR when
-  `hold_on` is set, so an unreviewed head never becomes mergeable; the next completed review
-  lifts it. The verdict is never milder than the review's own still-open findings (an open
+  `extra_instructions`, `hold_on`, `hold_label`, `label_mode`.
+  **Review labels** (`label_mode: review`, the default): after each review of the current head
+  the PR carries exactly one of these, and the other three are removed:
+
+  | Label | Meaning |
+  |---|---|
+  | `review:lgtm` | verdict `looks good` |
+  | `review:minor` | verdict `minor issues` |
+  | `review:changes` | verdict `needs changes` |
+  | `review:missing` | no review could run on this head (no credential, an API error, a timeout) |
+
+  A label the repository lacks is created with a fixed colour and description. The automerge
+  workflow refuses the labels in its `blocking_labels` (default: all but `review:lgtm`), so an
+  unreviewed head never becomes mergeable. `hold_on` (default `needs changes`; add
+  `minor issues` for a stricter repo) names the verdicts the review's comment calls blocking;
+  keep it in line with automerge's `blocking_labels`. In this mode the review never adds
+  `hold`; it still lifts a `hold` it placed itself earlier once a verdict outside `hold_on`
+  comes in, so a PR held before the switch is released by a clean re-review.
+  **Hold** (`label_mode: hold`, the earlier behaviour): when the verdict is in `hold_on`, the
+  review adds `hold_label` (default `hold`), which the automerge workflow refuses to merge, and
+  a review that can't finish also holds the PR when `hold_on` is set; the next completed review
+  lifts it. No `review:*` labels are set.
+  A PR from a fork fails this check (it can be neither reviewed nor labelled), so automerge
+  refuses it. The verdict is never milder than the review's own still-open findings (an open
   high/medium means `needs changes`). Callers trigger on `synchronize` too, so every push is reviewed (automerge waits for that check on
-  the current head; a run for a head the PR has already left exits before calling the model), and a passing review lifts a hold the review placed; a review that
-  finishes after a newer push leaves the label to the newer review. A `hold` a person
+  the current head; a run for a head the PR has already left exits before calling the model); a review that
+  finishes after a newer push leaves the labels to the newer review. A `hold` a person
   added is never removed. **Threads:** each run re-checks the review's own open inline
   threads against the current code, resolves the fixed ones with a reply naming the commit,
   and keeps still-valid ones open without re-posting them. To dismiss a finding, reply in its
@@ -180,7 +205,7 @@ jobs:
   caller adds `actions: read` and `checks: read` to its `claude-review` job's `permissions:`;
   (2) then the `review` job here requests them too. Until step 2 the job's token can't make
   those lookups, so every review is a full one. Doing step 2 first would stop every caller
-  that doesn't grant them from starting. To override, remove the label and re-run the automerge job. Never fails
+  that doesn't grant them from starting. To override, remove the blocking label and re-run the automerge job. Never fails
   the check (missing key, API error, timeout), so it never blocks automerge. Authenticates
   with Workload Identity Federation when the caller passes the `anthropic_*` identifiers and
   grants `id-token: write` (no stored key), otherwise with the `ANTHROPIC_API_KEY` secret;
