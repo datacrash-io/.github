@@ -77,6 +77,11 @@ on:
         required: false
         type: string
         default: 'datacrash-io-arc'
+      bot_authors:
+        description: "Space-separated bot logins whose pull requests are reviewed anyway; every other '[bot]' author is skipped."
+        required: false
+        type: string
+        default: 'datacrash-chaos-agent[bot]'
       anthropic_federation_rule_id:
         description: "Workload Identity Federation rule (fdrl_...). With the organization and service account IDs, authenticates through the job's GitHub OIDC token instead of ANTHROPIC_API_KEY. The caller must grant `id-token: write`. These are identifiers, not secrets; keep them in the (private) caller, not here."
         required: false
@@ -118,7 +123,8 @@ jobs:
     if: >-
       github.event_name == 'pull_request' &&
       !github.event.pull_request.draft &&
-      !endsWith(github.event.pull_request.user.login, '[bot]')
+      (!endsWith(github.event.pull_request.user.login, '[bot]') ||
+       contains(format(' {0} ', inputs.bot_authors), format(' {0} ', github.event.pull_request.user.login)))
     runs-on: ${{ inputs.runs_on }}
     # No concurrency group: a cancelled run reports as a failed check, which automerge
     # refuses, and a late event for an older head could cancel the current head's run.
