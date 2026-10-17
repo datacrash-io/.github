@@ -16,8 +16,10 @@ Shared GitHub Actions workflows for datacrash-io repositories.
   when a trusted sender (the owner account or `trusted_senders`) started it and its head is
   in this repository. Each run answers for one PR head and stops once the PR has moved on.
   A PR that a trusted sender did not ready (one an app opened) also merges once a trusted
-  user's account applied `review_label` (default `chaos-reviewed`) after its current head
-  was pushed; a later push needs the label applied again.
+  user's account applied `review_label` after its current head was pushed; a later push
+  needs the label applied again. `review_label` takes one name or several separated by spaces
+  or commas (default `review:approved chaos-reviewed`, the current name and the older one), and
+  any one that meets the rules counts.
 
   When a merge attempt fails, the PR stays ready by default (`draft_on_failure`, default
   `false`): it gets one comment per head commit, and the next push or finished check run
@@ -118,14 +120,17 @@ jobs:
   a review gate for pull requests from an automated agent's branches (head branch `chaos/` by
   default). Same-repository pull requests run CI with the repository's secrets, so put the action
   FIRST in every pull-request job that holds a secret or a write token. For an agent branch it fails
-  the job until the pull request carries the review label (`chaos-reviewed`), read live from the
+  the job until the pull request carries the review label (its `label` input: one name or several
+  separated by spaces or commas, default `review:approved chaos-reviewed`; any one that meets the rules
+  counts), read live from the
   API, last applied by `owner`, after the current head commit was pushed: an approval covers one
   commit, and a later push needs the label applied again. A run for an agent branch from any other
   event (push, workflow_dispatch) is denied. Every other run passes without an API call. It fails
   rather than skips, because a skipped check counts as passing. Callers with a `permissions:` block
   grant `pull-requests: read` and `contents: read`. The reusable workflow, called on `pull_request: [labeled]`, removes
-  `release_labels` (default `hold chaos-agent`: the owner's label is the single approval), then closes
-  and reopens the pull request when the owner applies the label. Called on `issues: [labeled]` as
+  `release_labels` (default `review:owner agent:pr hold chaos-agent`: the owner's label is the single approval), then closes
+  and reopens the pull request when the owner applies the label (`label`, default `review:approved`, or any
+  name in `labels`, default `review:approved chaos-reviewed`; the run acts on the name that was applied). Called on `issues: [labeled]` as
   well, it moves an owner's label on an issue to the ONE open same-repository agent-branch pull
   request by `agent_author` that closes the issue (and only that issue), applying it to that pull request with the token
   (as the owner). It does this only if that pull request referenced the issue, and its current head

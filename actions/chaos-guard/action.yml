@@ -14,8 +14,9 @@ description: >-
 #
 # It passes when:
 #   - neither the pull request's head branch nor the workflow's ref starts with branch_prefix, or
-#   - it is a pull_request / pull_request_target run, and all of these hold, read live from the API:
-#     the pull request carries `label`; the most recent time the label was applied, `owner` applied it;
+#   - it is a pull_request / pull_request_target run, and for at least one of the names in `label` all of
+#     these hold, read live from the API: the pull request carries that label; the most recent time it was
+#     applied, `owner` applied it;
 #     the pull request's head is still the commit this run was started for; and the label was applied
 #     after that head commit was pushed (the push time from the repository's activity log) and after
 #     its committer date. So an approval covers exactly the commit the owner saw: any later push needs
@@ -33,9 +34,11 @@ inputs:
     description: Login whose application of the review label releases the gate.
     required: true
   label:
-    description: The review label.
+    description: >-
+      The review label, or several names separated by spaces or commas; any one of them that meets every
+      rule releases the gate. The default accepts the current name and the older one.
     required: false
-    default: chaos-reviewed
+    default: review:approved chaos-reviewed
   branch_prefix:
     description: Head branches starting with this are gated.
     required: false
@@ -65,7 +68,10 @@ runs:
         branch=""
         if [[ "$HEAD_REF" == "$PREFIX"* ]]; then branch=$HEAD_REF; elif [[ "$REF_NAME" == "$PREFIX"* ]]; then branch=$REF_NAME; fi
         [[ -n "$branch" ]] || exit 0
-        deny() { echo "::error::agent branch $branch: $1. The owner applies '$LABEL' after reviewing the pull request's current head."; exit 1; }
+        read -ra name_list <<<"${LABEL//,/ }"
+        names=${name_list[*]:-}
+        [[ -n "$names" ]] || { echo "::error::agent branch $branch: no review label configured"; exit 1; }
+        deny() { echo "::error::agent branch $branch: $1. The owner applies one of '$names' after reviewing the pull request's current head."; exit 1; }
         case "$EVENT_NAME" in pull_request|pull_request_target) ;; *) deny "a '$EVENT_NAME' run has no pull request review" ;; esac
         [[ "$HEAD_REF" == "$PREFIX"* ]] || deny "the pull request's head branch is not the agent branch"
         command -v gh >/dev/null && command -v jq >/dev/null || deny "gh or jq is not installed"
@@ -73,13 +79,12 @@ runs:
         repo=$GITHUB_REPOSITORY
 
         labels=$(gh api "repos/$repo/issues/$PR/labels" --paginate --jq '.[].name') || deny "could not read the labels"
-        grep -qxF -- "$LABEL" <<<"$labels" || deny "not reviewed yet"
+        present=()
+        for name in "${name_list[@]}"; do if grep -qxF -- "$name" <<<"$labels"; then present+=("$name"); fi; done
+        [[ ${#present[@]} -gt 0 ]] || deny "not reviewed yet"
         events=$(gh api "repos/$repo/issues/$PR/events" --paginate \
                    --jq '.[] | select(.event == "labeled") | [.label.name, .actor.login, .created_at] | @tsv') \
           || deny "could not read who applied the label"
-        last=$(awk -F'\t' -v l="$LABEL" '$1 == l { who = $2; at = $3 } END { print who "\t" at }' <<<"$events")
-        by=${last%%$'\t'*}; labeled_at=${last#*$'\t'}
-        [[ "$by" == "$OWNER" ]] || deny "'$LABEL' was last applied by '${by:-unknown}', not the owner"
 
         # The approval is for one commit: the head now, which must be the head this run is for.
         live=$(gh api "repos/$repo/pulls/$PR" --jq '.head.sha') || deny "could not read the pull request"
@@ -90,6 +95,16 @@ runs:
                       --jq "[.[] | select(.after == \"$live\")] | first | .timestamp // empty") || deny "could not read the branch's push history"
         [[ -n "$pushed_at" ]] || deny "no push of ${live:0:7} found in the activity log"
         newer() { jq -en --arg a "$1" --arg b "$2" '($a | sub("\\.[0-9]+"; "") | fromdateiso8601) > ($b | sub("\\.[0-9]+"; "") | fromdateiso8601)' >/dev/null; }
-        newer "$labeled_at" "$pushed_at" || deny "'$LABEL' ($labeled_at) predates the push of ${live:0:7} ($pushed_at)"
-        newer "$labeled_at" "$committed_at" || deny "'$LABEL' ($labeled_at) predates head commit ${live:0:7} ($committed_at)"
-        echo "agent branch $branch: ${live:0:7} reviewed ('$LABEL' applied by $by at $labeled_at, after its push at $pushed_at)"
+
+        # Any one label on the pull request that passes every rule is the approval.
+        reasons=()
+        for LABEL in "${present[@]}"; do
+          last=$(awk -F'\t' -v l="$LABEL" '$1 == l { who = $2; at = $3 } END { print who "\t" at }' <<<"$events")
+          by=${last%%$'\t'*}; labeled_at=${last#*$'\t'}
+          if [[ "$by" != "$OWNER" ]]; then reasons+=("'$LABEL' was last applied by '${by:-unknown}', not the owner"); continue; fi
+          if ! newer "$labeled_at" "$pushed_at"; then reasons+=("'$LABEL' ($labeled_at) predates the push of ${live:0:7} ($pushed_at)"); continue; fi
+          if ! newer "$labeled_at" "$committed_at"; then reasons+=("'$LABEL' ($labeled_at) predates head commit ${live:0:7} ($committed_at)"); continue; fi
+          echo "agent branch $branch: ${live:0:7} reviewed ('$LABEL' applied by $by at $labeled_at, after its push at $pushed_at)"
+          exit 0
+        done
+        deny "$(printf '%s; ' "${reasons[@]}" | sed 's/; $//')"
