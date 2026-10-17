@@ -133,6 +133,17 @@ on:
         required: false
         type: string
         default: 'hold'
+      draft_on_failure:
+        description: >-
+          When a merge attempt fails (a check failed, a conflict), move the PR back
+          to draft and comment, so it waits until someone marks it ready again.
+          Set false to leave it ready instead: it gets one comment per head commit,
+          and the next push or finished check run retries the merge on its own,
+          which suits PRs an automated agent fixes. Either way a PR carrying
+          hold_label is left as it is, since it was never meant to merge yet.
+        required: false
+        type: boolean
+        default: true
       review_label:
         description: >-
           On the `workflow_run` path, a PR that a trusted sender did not ready
@@ -725,9 +736,19 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PR_NUMBER: ${{ steps.pr.outputs.number }}
+          HEAD_SHA: ${{ steps.pr.outputs.head_sha }}
+          HOLD_LABEL: ${{ inputs.hold_label }}
+          DRAFT_ON_FAILURE: ${{ inputs.draft_on_failure }}
           REPO: ${{ github.repository }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
+          # A held PR was not going to merge anyway: leave it ready and quiet. If the labels
+          # cannot be read, fall through to the usual handling.
+          if [ -n "$HOLD_LABEL" ] && labels=$(gh pr view "$PR_NUMBER" --repo "$REPO" --json labels --jq '.labels[].name') \
+              && grep -qxF "$HOLD_LABEL" <<<"$labels"; then
+            echo "PR #$PR_NUMBER carries '$HOLD_LABEL': left as it is."
+            exit 0
+          fi
           if grep -q 'without .workflows. permission' "$RUNNER_TEMP/merge-error.txt" 2>/dev/null; then
             gh pr comment "$PR_NUMBER" --repo "$REPO" --body-file - <<'BODY'
           **Merge this one by hand** — re-marking it ready will not help.
@@ -749,10 +770,19 @@ jobs:
           draft PR cannot be merged, which would make the instruction above impossible to
           follow.
           BODY
-          else
+          elif [ "$DRAFT_ON_FAILURE" = "true" ]; then
             gh pr ready "$PR_NUMBER" --repo "$REPO" --undo
             gh pr comment "$PR_NUMBER" --repo "$REPO" --body \
               "Automerge failed, so this PR was moved back to draft instead of being left stuck ready-for-review with failing checks. See the run for why: $RUN_URL. Fix the issue and mark it ready for review again to retry."
+          else
+            # Left ready: the next push or finished check run retries. One comment per head.
+            marker="<!-- automerge-failed:$HEAD_SHA -->"
+            if gh api "repos/$REPO/issues/$PR_NUMBER/comments" --paginate --jq '.[].body' 2>/dev/null | grep -qF "$marker"; then
+              echo "PR #$PR_NUMBER: already commented for ${HEAD_SHA:0:7}."
+            else
+              gh pr comment "$PR_NUMBER" --repo "$REPO" --body \
+                "Automerge could not merge ${HEAD_SHA:0:7}: $RUN_URL. The PR stays ready; a new push or a finished check run retries the merge. $marker"
+            fi
           fi
 
       # GitHub ignores closing keywords ("Closes #N") on a merge made with GITHUB_TOKEN,
