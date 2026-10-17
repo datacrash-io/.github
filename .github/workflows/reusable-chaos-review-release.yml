@@ -10,6 +10,8 @@ name: Reusable - Agent branch review release
 # reopen it removes `release_labels` (the agent's hold) from that pull request, last, so the automerge run
 # that the removal starts already sees the reopened checks: the owner's review label is the single
 # approval. A label applied by anyone else does nothing here.
+# The review label may go by more than one name (`label` plus `labels`, for a rename): whichever of them
+# the owner applied is the one this run checks, and the one it moves from an issue to a pull request.
 # Through an issue it moves the label to exactly one pull request (see `agent_author`), never a guess.
 #
 # With `dependabot: true` it also releases a Dependabot pull request (opened by dependabot[bot] from a
@@ -33,7 +35,7 @@ name: Reusable - Agent branch review release
 #       types: [labeled]
 #   jobs:
 #     release:
-#       if: github.event.label.name == 'chaos-reviewed'
+#       if: contains(fromJSON('["review:approved", "chaos-reviewed"]'), github.event.label.name)
 #       uses: datacrash-io/.github/.github/workflows/reusable-chaos-review-release.yml@main
 #       with:
 #         owner: <owner login>
@@ -59,12 +61,21 @@ on:
         description: Labels removed from the released pull request, so automerge can merge it once its checks pass.
         required: false
         type: string
-        default: 'hold chaos-agent'
+        default: 'review:owner agent:pr hold chaos-agent'
       label:
-        description: The review label (same as the chaos-guard action's).
+        description: >-
+          The review label (same as the chaos-guard action's). Names in `labels` are accepted as well; the run
+          acts on whichever accepted name the owner applied.
         required: false
         type: string
-        default: chaos-reviewed
+        default: review:approved
+      labels:
+        description: >-
+          More accepted names for the review label, separated by spaces or commas (for example an older name
+          kept during a rename). Empty accepts only `label`.
+        required: false
+        type: string
+        default: 'review:approved chaos-reviewed'
       branch_prefix:
         description: Head branches starting with this are agent branches.
         required: false
@@ -95,7 +106,8 @@ permissions: {}
 jobs:
   rerun:
     if: >-
-      github.event.action == 'labeled' && github.event.label.name == inputs.label
+      github.event.action == 'labeled'
+      && (github.event.label.name == inputs.label || contains(inputs.labels, github.event.label.name))
       && github.actor == inputs.owner && github.triggering_actor == inputs.owner
       && github.event.sender.login == inputs.owner
       && ((github.event_name == 'pull_request' && startsWith(github.head_ref, inputs.branch_prefix))
@@ -117,10 +129,16 @@ jobs:
           AGENT_AUTHOR: ${{ inputs.agent_author }}
           OWNER: ${{ inputs.owner }}
           RELEASE_LABELS: ${{ inputs.release_labels }}
-          LABEL: ${{ inputs.label }}
+          LABEL: ${{ github.event.label.name }}
+          ACCEPTED: ${{ inputs.label }} ${{ inputs.labels }}
           REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
+          # The job's `if` only did a substring match on `labels`: require an exact accepted name.
+          read -ra accepted <<<"${ACCEPTED//,/ }"
+          match=false
+          for name in "${accepted[@]}"; do if [ "$name" = "$LABEL" ]; then match=true; fi; done
+          [ "$match" = true ] || { echo "'$LABEL' is not a review label here: nothing to do"; exit 0; }
           if [ "$EVENT_NAME" = issues ]; then
             # The owner's label on an issue is MOVED to the one agent pull request it approves, applied with this
             # token (as the owner); that pull request's own `labeled` event then runs the release below, and the gate
