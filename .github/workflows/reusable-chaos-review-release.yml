@@ -136,10 +136,13 @@ jobs:
             # gh shows an app author as `app/<slug>`, the REST API as `<slug>[bot]`: accept the forms of one login.
             slug=${AGENT_AUTHOR%\[bot\]}
             matches=$(gh pr list -R "$REPO" --state open --limit 200 \
-              --json number,headRefName,headRefOid,isCrossRepository,author,closingIssuesReferences \
+              --json number,headRefName,headRefOid,isCrossRepository,author,closingIssuesReferences,body \
               --jq ".[] | select(.isCrossRepository | not) | select(.headRefName | startswith(\"$PREFIX\"))
                     | select(.author.login == \"$AGENT_AUTHOR\" or .author.login == \"$slug\" or .author.login == \"app/$slug\")
-                    | select([.closingIssuesReferences[].number] == [$ISSUE]) | [.number, .headRefName, .headRefOid] | @tsv")
+                    | select(([.closingIssuesReferences[].number] == [$ISSUE])
+                        or (([.closingIssuesReferences[]] | length) == 0
+                            and ((.body // \"\") | split(\"\\n\")[0] | rtrimstr(\"\\r\")) == \"Refs https://github.com/$REPO/issues/$ISSUE\"))
+                    | [.number, .headRefName, .headRefOid] | @tsv")
             count=$(grep -c . <<<"$matches" || true)
             if [ "$count" != 1 ]; then
               say "'$LABEL' on this issue matches $count open agent pull requests, so it was not applied to any. Apply '$LABEL' to the pull request you reviewed."
@@ -147,14 +150,15 @@ jobs:
             fi
             IFS=$'\t' read -r pr head_ref head_sha <<<"$matches"
             before() { jq -en --arg a "$1" --arg b "$2" '($a | sub("\\.[0-9]+"; "") | fromdateiso8601) < ($b | sub("\\.[0-9]+"; "") | fromdateiso8601)' >/dev/null; }
-            # The pull request must have referenced the issue before the label: the earliest link or closing
-            # cross-reference from it in the issue's timeline.
+            # The pull request must have referenced the issue before the label: the earliest link or cross-reference
+            # from it in the issue's timeline. A pull request may close its issue or, when the issue closes only after
+            # its done-criteria are verified, only reference it with a first body line `Refs <issue URL>`.
             # shellcheck disable=SC2016  # the GraphQL document is single-quoted on purpose
             ref_at=$(gh api graphql -F n="$ISSUE" -f o="${REPO%%/*}" -f r="${REPO#*/}" -f query='query($o: String!, $r: String!, $n: Int!) {
                 repository(owner: $o, name: $r) { issue(number: $n) { timelineItems(first: 100, itemTypes: [CONNECTED_EVENT, CROSS_REFERENCED_EVENT]) { nodes {
                   ... on ConnectedEvent { createdAt subject { ... on PullRequest { number } } }
                   ... on CrossReferencedEvent { createdAt willCloseTarget source { ... on PullRequest { number } } } } } } } }' \
-              --jq "[.data.repository.issue.timelineItems.nodes[] | select((.subject.number // .source.number) == $pr and (.willCloseTarget // true)) | .createdAt] | min // empty")
+              --jq "[.data.repository.issue.timelineItems.nodes[] | select((.subject.number // .source.number) == $pr) | .createdAt] | min // empty")
             # The pull request's current head must have been pushed before the label: what the owner reviewed.
             pushed_at=$(gh api -X GET "repos/$REPO/activity" -f ref="refs/heads/$head_ref" -f per_page=100 \
               --jq "[.[] | select(.after == \"$head_sha\")] | first | .timestamp // empty")
