@@ -19,10 +19,10 @@ Shared GitHub Actions workflows for datacrash-io repositories.
   user's account applied `review_label` (default `chaos-reviewed`) after its current head
   was pushed; a later push needs the label applied again.
 
-  When a merge attempt fails, the PR is moved back to draft by default (`draft_on_failure`,
-  default `true`) and waits until someone marks it ready. With `draft_on_failure: false` it
-  stays ready, gets one comment per head commit, and the next push or finished check run
-  retries the merge. A PR carrying `hold_label` is never drafted.
+  When a merge attempt fails, the PR stays ready by default (`draft_on_failure`, default
+  `false`): it gets one comment per head commit, and the next push or finished check run
+  retries the merge. With `draft_on_failure: true` it is moved back to draft and waits until
+  someone marks it ready. A PR carrying `hold_label` is never drafted.
 
   **Dependabot PRs merge on their own** (`merge_dependabot`, default `true`; set `false` to
   merge them by hand). On the `workflow_run` path a run Dependabot started is let through,

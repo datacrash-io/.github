@@ -135,15 +135,15 @@ on:
         default: 'hold'
       draft_on_failure:
         description: >-
-          When a merge attempt fails (a check failed, a conflict), move the PR back
-          to draft and comment, so it waits until someone marks it ready again.
-          Set false to leave it ready instead: it gets one comment per head commit,
-          and the next push or finished check run retries the merge on its own,
-          which suits PRs an automated agent fixes. Either way a PR carrying
+          When a merge attempt fails (a check failed, a conflict), leave the PR
+          ready (the default): it gets one comment per head commit, and the next
+          push or finished check run retries the merge on its own. Set true to
+          move it back to draft instead, so it waits until someone marks it
+          ready again. Either way a PR carrying
           hold_label is left as it is, since it was never meant to merge yet.
         required: false
         type: boolean
-        default: true
+        default: false
       review_label:
         description: >-
           On the `workflow_run` path, a PR that a trusted sender did not ready
