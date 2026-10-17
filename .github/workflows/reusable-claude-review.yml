@@ -7,11 +7,18 @@ name: Reusable - Claude PR Review
 #
 # The check itself never fails: the review step is continue-on-error, so a missing
 # key, an API error or a timeout never turns it red (automerge refuses red checks).
-# With hold_on set, though, such a run holds the PR instead: an unreviewed head is
-# never mergeable just because the reviewer broke.
-# The gate is the hold label: a verdict listed in hold_on adds it, the shared
-# automerge workflow won't merge a PR carrying it, and a passing review of a later
-# push lifts a hold the review placed. A hold a person added is never touched.
+# Such a run labels the PR instead: an unreviewed head is never mergeable just because
+# the reviewer broke.
+# The gate is a label, chosen by label_mode:
+# - review (default): after each review of the current head the PR carries exactly one
+#   of review:lgtm, review:minor, review:changes (the verdict) or review:missing (no
+#   review could run). The shared automerge workflow refuses the labels in its
+#   blocking_labels input (default: all but review:lgtm). hold_on names the verdicts the
+#   review's comment calls blocking; keep it in line with the caller's blocking_labels.
+# - hold: the older behaviour. A verdict listed in hold_on adds the hold label, which
+#   automerge refuses, and a passing review of a later push lifts it.
+# Either way the review removes only a hold it placed itself; one a person added is
+# never touched, and in review mode it never adds one.
 #
 # Auth: Workload Identity Federation when the caller passes the anthropic_*
 # identifiers and grants `id-token: write` (no stored key: the job's GitHub OIDC
@@ -41,15 +48,20 @@ on:
         type: number
         default: 25
       hold_on:
-        description: "Comma-separated verdicts that make the review add the hold label, which the shared automerge workflow refuses to merge: 'needs changes' (default), add 'minor issues' for a stricter repo, or '' to never hold."
+        description: "Comma-separated verdicts that block a merge: 'needs changes' (default), add 'minor issues' for a stricter repo, or '' for none. With label_mode hold these verdicts (and, when set, a review that could not run) add the hold label. With label_mode review the review always sets its review:* label, and hold_on only decides which of them its comment calls blocking (a verdict listed here, and review:missing when it is not empty); the automerge workflow's blocking_labels decides what actually blocks, so keep the two in line (needs changes = review:changes, minor issues = review:minor)."
         required: false
         type: string
         default: 'needs changes'
       hold_label:
-        description: "Label the review adds to hold a PR; must match the automerge workflow's hold_label."
+        description: "Label the review adds to hold a PR in label_mode hold, and the one it lifts after a passing review in either mode when the review had added it; must match the automerge workflow's hold_label."
         required: false
         type: string
         default: 'hold'
+      label_mode:
+        description: "'review' (default): after each review of the current head the PR carries exactly one review label: review:lgtm (looks good), review:minor (minor issues), review:changes (needs changes) or review:missing (no credential, or the review failed or timed out). The others are removed, a missing label is created with its colour and description, and the hold label is never added. 'hold': the earlier behaviour, one hold_label for a verdict in hold_on and no review:* labels."
+        required: false
+        type: string
+        default: 'review'
       max_budget_usd:
         description: "Stop a review once its estimated cost reaches this many USD."
         required: false
@@ -180,10 +192,10 @@ jobs:
           set -euo pipefail
           mv .claude-review-tool/claude-review "$RUNNER_TEMP/claude-review"
           # Context for the agent, inside the workspace it may read; never committed.
-          # Includes the reviewer script itself, so claims about hold, thread or
+          # Includes the reviewer script itself, so claims about label, thread or
           # permission handling can be checked against its code.
           mkdir -p .datacrash-shared/claude-review
-          cp "$RUNNER_TEMP/claude-review/review.mjs" .datacrash-shared/claude-review/
+          cp "$RUNNER_TEMP/claude-review/review.mjs" "$RUNNER_TEMP/claude-review/labels.mjs" .datacrash-shared/claude-review/
           mv .claude-review-tool/.github/workflows .datacrash-shared/workflows
           mv .claude-review-tool/CLAUDE.md .claude-review-tool/README.md .datacrash-shared/
           rm -rf .claude-review-tool
@@ -205,6 +217,7 @@ jobs:
           EXTRA_INSTRUCTIONS: ${{ inputs.extra_instructions }}
           HOLD_ON: ${{ inputs.hold_on }}
           HOLD_LABEL: ${{ inputs.hold_label }}
+          LABEL_MODE: ${{ inputs.label_mode }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           AUTH_MODE: ${{ steps.key.outputs.mode }}
           ANTHROPIC_API_KEY: ${{ steps.key.outputs.mode == 'key' && secrets.ANTHROPIC_API_KEY || '' }}
@@ -216,12 +229,51 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: node "$RUNNER_TEMP/claude-review/review.mjs"
 
-      # The script holds the PR itself when a review can't finish, but not when the step
+      # The script labels the PR itself when a review can't finish, but not when the step
       # is killed (timeout) or never ran because no credential was available. Same rule:
-      # with hold_on set, an unreviewed current head is held until a review completes.
+      # an unreviewed current head carries review:missing (label_mode review) or, with
+      # hold_on set, the hold label (label_mode hold) until a review completes.
+      - name: Label the PR review:missing if no review ran
+        if: >-
+          always() && inputs.label_mode != 'hold' &&
+          (steps.key.outputs.present != 'true' || steps.review.outcome == 'failure')
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          BLOCKS: ${{ inputs.hold_on != '' }}
+          WHY: ${{ steps.key.outputs.present != 'true' && 'no Anthropic credential was available' || 'the review step failed or timed out' }}
+        run: |
+          set -euo pipefail
+          missing=review:missing
+          head=$(gh pr view "$PR_NUMBER" --repo "$REPO" --json headRefOid --jq .headRefOid)
+          if [ "$head" != "$HEAD_SHA" ]; then echo "A newer push is being reviewed; leaving the label to it."; exit 0; fi
+          labels=$(gh api "repos/$REPO/issues/$PR_NUMBER/labels" --paginate --jq '.[].name')
+          # Exactly one review label: drop the verdict labels of earlier heads.
+          for other in review:lgtm review:minor review:changes; do
+            if grep -qxF "$other" <<<"$labels"; then
+              gh api --method DELETE "repos/$REPO/issues/$PR_NUMBER/labels/${other/:/%3A}" >/dev/null
+              echo "Removed $other."
+            fi
+          done
+          if grep -qxF "$missing" <<<"$labels"; then echo "Already on $missing."; exit 0; fi
+          # Always with colour and description: without them --force re-colours the label.
+          gh label create "$missing" --repo "$REPO" --force --color BFBFBF --description "Claude review could not run on this head" \
+            || echo "::warning::Could not create or update the $missing label; adding it anyway."
+          gh api --method POST "repos/$REPO/issues/$PR_NUMBER/labels" -f "labels[]=$missing" >/dev/null
+          if [ "$BLOCKS" = "true" ]; then
+            effect="automerge won't merge this PR until a review of its head completes"
+          else
+            effect="no review of this head has completed"
+          fi
+          gh pr comment "$PR_NUMBER" --repo "$REPO" --body ":no_entry: **Claude review could not complete** ($WHY). Added \`$missing\`: $effect. Push again or re-run the review job."
+          echo "::warning title=No review of this head::$WHY"
+
       - name: Hold the PR if no review ran
         if: >-
-          always() && inputs.hold_on != '' &&
+          always() && inputs.label_mode == 'hold' && inputs.hold_on != '' &&
           (steps.key.outputs.present != 'true' || steps.review.outcome == 'failure')
         continue-on-error: true
         env:
