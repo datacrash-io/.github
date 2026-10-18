@@ -147,7 +147,9 @@ on:
           review label at all is not blocked by that: required_check_workflows
           already waits for the review's check on the current head. Drop
           `review:minor` for a repository that lets minor findings merge (and its
-          review's hold_on to match), or pass '' to turn this off.
+          review's hold_on to match), or pass '' to turn this off. The variable AUTOMERGE_BLOCKING_LABELS
+          (organization or repository) overrides this input when set, so the list
+          changes without editing callers; `none` blocks on no label.
         required: false
         type: string
         default: 'review:minor,review:changes,review:missing,review:owner'
@@ -220,7 +222,7 @@ jobs:
     if: >-
       (github.event_name == 'pull_request' && github.event.pull_request.draft == false && (github.event.sender.login == '3h4x' || contains(fromJSON(inputs.trusted_senders), github.event.sender.login))
         && (github.event.action != 'unlabeled' || github.event.label.name == inputs.hold_label
-          || contains(format(',{0},', inputs.blocking_labels), format(',{0},', github.event.label.name))))
+          || contains(format(',{0},', (vars.AUTOMERGE_BLOCKING_LABELS != '' && vars.AUTOMERGE_BLOCKING_LABELS || inputs.blocking_labels)), format(',{0},', github.event.label.name))))
       || (github.event_name == 'workflow_run' && (github.event.workflow_run.event == 'pull_request' || github.event.workflow_run.event == 'pull_request_target')
         && github.event.workflow_run.head_repository.full_name == github.repository
         && (((github.event.workflow_run.actor.login == '3h4x' || contains(fromJSON(inputs.trusted_senders), github.event.workflow_run.actor.login))
@@ -513,7 +515,7 @@ jobs:
           ALLOW_NO_CHECKS: ${{ inputs.allow_merge_with_no_checks }}
           WAIT_FOR_PENDING: ${{ github.event_name == 'pull_request' && inputs.wait_for_pending_checks }}
           HOLD_LABEL: ${{ inputs.hold_label }}
-          BLOCKING_LABELS: ${{ inputs.blocking_labels }}
+          BLOCKING_LABELS: ${{ (vars.AUTOMERGE_BLOCKING_LABELS != '' && vars.AUTOMERGE_BLOCKING_LABELS || inputs.blocking_labels) }}
           DEPENDABOT: ${{ steps.pr.outputs.dependabot }}
           HAS_AUTOMERGE_TOKEN: ${{ secrets.AUTOMERGE_TOKEN != '' }}
         run: |
@@ -523,6 +525,7 @@ jobs:
 
           # blocking_labels, split on commas and trimmed.
           blocking=()
+          [ "$BLOCKING_LABELS" = none ] && BLOCKING_LABELS=''
           IFS=',' read -r -a raw_blocking <<< "$BLOCKING_LABELS"
           for l in ${raw_blocking[@]+"${raw_blocking[@]}"}; do
             l="${l#"${l%%[![:space:]]*}"}"; l="${l%"${l##*[![:space:]]}"}"
@@ -784,7 +787,7 @@ jobs:
           PR_NUMBER: ${{ steps.pr.outputs.number }}
           HEAD_SHA: ${{ steps.pr.outputs.head_sha }}
           HOLD_LABEL: ${{ inputs.hold_label }}
-          BLOCKING_LABELS: ${{ inputs.blocking_labels }}
+          BLOCKING_LABELS: ${{ (vars.AUTOMERGE_BLOCKING_LABELS != '' && vars.AUTOMERGE_BLOCKING_LABELS || inputs.blocking_labels) }}
           DRAFT_ON_FAILURE: ${{ inputs.draft_on_failure }}
           REPO: ${{ github.repository }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
@@ -792,6 +795,7 @@ jobs:
           # A held PR, or one with a blocking label, was not going to merge anyway: leave it
           # ready and quiet. If the labels cannot be read, fall through to the usual handling.
           if labels=$(gh pr view "$PR_NUMBER" --repo "$REPO" --json labels --jq '.labels[].name'); then
+            [ "$BLOCKING_LABELS" = none ] && BLOCKING_LABELS=''
             IFS=',' read -r -a stoppers <<< "$BLOCKING_LABELS"
             stoppers+=("$HOLD_LABEL")
             for l in "${stoppers[@]}"; do
