@@ -91,6 +91,15 @@ on:
         required: false
         type: boolean
         default: false
+      reopen:
+        description: >-
+          When an agent pull request is released: `always` closes and reopens it so every pull_request workflow runs
+          again with the approval (needed where a job skips or fails until approval, such as a chaos-guard job);
+          `when-failed` only does that when a check of its head did not pass, and otherwise just removes
+          `release_labels` (no new check runs, no new review).
+        required: false
+        type: string
+        default: always
       runs_on:
         description: Runner label for the job.
         required: false
@@ -129,6 +138,7 @@ jobs:
           AGENT_AUTHOR: ${{ inputs.agent_author }}
           OWNER: ${{ inputs.owner }}
           RELEASE_LABELS: ${{ inputs.release_labels }}
+          REOPEN: ${{ inputs.reopen }}
           LABEL: ${{ github.event.label.name }}
           ACCEPTED: ${{ inputs.label }} ${{ inputs.labels }}
           REPO: ${{ github.repository }}
@@ -264,6 +274,18 @@ jobs:
             exit 0
           fi
           pr=$PR
+          # reopen: when-failed and every check of the head passed: nothing needs to run again, so only lift the hold
+          # (its removal starts the automerge run). Any read that fails falls through to the close and reopen.
+          if [ "$REOPEN" = when-failed ]; then
+            head_sha=$(gh api "repos/$REPO/pulls/$pr" --jq .head.sha 2>/dev/null || true)
+            failed=$([ -n "$head_sha" ] && gh api "repos/$REPO/commits/$head_sha/check-runs?per_page=100" \
+              --jq '[.check_runs[] | select(.status == "completed" and ((.conclusion == "success" or .conclusion == "skipped" or .conclusion == "neutral") | not))] | length' 2>/dev/null || true)
+            if [ "$failed" = 0 ]; then
+              for l in $RELEASE_LABELS; do gh pr edit "$pr" -R "$REPO" --remove-label "$l" >/dev/null 2>&1 || true; done
+              echo "#$pr: no failed check on ${head_sha:0:7}; the hold is lifted and automerge takes it from here"
+              exit 0
+            fi
+          fi
           # The owner's review is the single approval. Close and reopen first, so the checks start again as the owner;
           # then lift the agent's hold, last: removing it starts an automerge run, which must see the reopened checks.
           gh pr close "$pr" -R "$REPO" --comment "Approved by the owner. Closing and reopening only restarts the checks with the approval; this is not a rejection. Automerge takes it once they pass."
