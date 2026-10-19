@@ -131,7 +131,7 @@ jobs:
   grant `pull-requests: read` and `contents: read`. The reusable workflow, called on `pull_request: [labeled]`, removes
   `release_labels` (default `review:owner agent:pr hold chaos-agent`: the owner's label is the single approval), then closes
   and reopens the pull request when the owner applies the label (`label`, default `review:approved`, or any
-  name in `labels`, default `review:approved chaos-reviewed`; the run acts on the name that was applied). Called on `issues: [labeled]` as
+  name in `labels`, default `review:approved chaos-reviewed`; the run acts on the name that was applied). With `reopen: when-failed` (default `always`) it skips the close and reopen when every check of the head already passed, and only removes `release_labels`, so no check and no review runs again; use it where no pull_request job waits for the approval. Called on `issues: [labeled]` as
   well, it moves an owner's label on an issue to the ONE open same-repository agent-branch pull
   request by `agent_author` that closes the issue (and only that issue), applying it to that pull request with the token
   (as the owner). It does this only if that pull request referenced the issue, and its current head
