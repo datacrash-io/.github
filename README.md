@@ -168,6 +168,10 @@ jobs:
   a Claude plan don't cover. The agent reads the repo but has no shell and no GitHub token; the
   script posts its findings. Inputs: `model` (empty = claude-sonnet-5-5; callers pass `vars.CLAUDE_REVIEW_MODEL`), `max_turns`, `max_budget_usd` (default 1),
   `extra_instructions`, `hold_on`, `hold_label`, `label_mode`.
+  **Diff size:** generated files (lockfiles such as `pnpm-lock.yaml` or `go.sum`, minified bundles, source maps,
+  snapshots) are left out of the diff the model reads and listed in the prompt with their line counts and the URL
+  hosts on their added lines. If the rest is over 150,000 characters, the largest files are left out whole and listed
+  for the reviewer to read in the checkout. The review comment's footer says what was left out.
   **Review labels** (`label_mode: review`, the default): after each review of the current head
   the PR carries exactly one of these, and the other three are removed:
 
