@@ -728,7 +728,20 @@ jobs:
               else
                 echo "All checks passed. Merging."
               fi
-              if gh pr merge "${merge_args[@]}" "$PR_NUMBER" --repo "$REPO" 2> "$RUNNER_TEMP/merge-error.txt"; then
+              # Two PRs merged in the same second: GitHub refuses the second with "Base branch was
+              # modified", and nothing re-triggers this run afterwards (no push, no check), so the PR
+              # would sit ready and green. Try again a few times; any other error is not retried.
+              merge_ok=false
+              for merge_try in 1 2 3 4; do
+                if gh pr merge "${merge_args[@]}" "$PR_NUMBER" --repo "$REPO" 2> "$RUNNER_TEMP/merge-error.txt"; then
+                  merge_ok=true
+                  break
+                fi
+                grep -q 'Base branch was modified' "$RUNNER_TEMP/merge-error.txt" || break
+                echo "Base branch moved during the merge (try $merge_try/4), retrying."
+                sleep $((merge_try * 5))
+              done
+              if [ "$merge_ok" = true ]; then
                 # gh also exits 0 when the PR was merged after its last read here: it skips
                 # the merge and warns "Pull request <repo>#<n> was already merged". Then a
                 # person or another run merged it, and that run dispatches the post-merge
