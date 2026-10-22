@@ -34,7 +34,9 @@ Shared GitHub Actions workflows for datacrash-io repositories.
   repositories whose PRs are merged by an external merger. Both are read once every check has
   finished, right before the merge, and a failed read means no merge. `review:lgtm` never
   blocks, and a PR with no review label is not blocked by that alone: `required_check_workflows`
-  already waits for the review's check on the current head. A repository that lets minor
+  already waits for the review's check on the current head. An entry there may also name a commit
+  status context instead of a workflow (an external reviewer's): it is met only by the newest status of
+  that context on the head in state `success`, posted by the owner or a `trusted_senders` login. A repository that lets minor
   findings merge drops `review:minor` here (and from its review's `hold_on`); `''` turns it off.
   `review:pending` (a head an external reviewer has not reviewed yet, see the review's `engine`)
   always blocks, whatever the list says, and removing it starts a merge like a blocking label.

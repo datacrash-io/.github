@@ -31,7 +31,7 @@ on:
         type: boolean
         default: false
       required_check_workflows:
-        description: "JSON array of workflow names that must have reported a check on the PR before it can merge. Default: the Claude review, whose check can lag the others; without it, a fix push could see every other check green and read the previous review's label before that push's review had even started. '[]' for a repo without it."
+        description: "JSON array of workflow names that must have reported a check on the PR before it can merge. A name no workflow reports may also be a commit status context, met only by a `success` status on the head posted by the owner or a trusted_senders login (the newest status of that context counts). Default: the Claude review, whose check can lag the others; without it, a fix push could see every other check green and read the previous review's label before that push's review had even started. '[]' for a repo without it."
         required: false
         type: string
         default: '["Security & Review"]'
@@ -520,6 +520,7 @@ jobs:
           SELF_WORKFLOW: ${{ github.workflow }}
           MERGE_STRATEGY: ${{ inputs.merge_strategy }}
           REQUIRED_CHECK_WORKFLOWS: ${{ inputs.required_check_workflows }}
+          TRUSTED: ${{ inputs.trusted_senders }}
           HEAD_SHA: ${{ steps.pr.outputs.head_sha }}
           ALLOW_NO_CHECKS: ${{ inputs.allow_merge_with_no_checks }}
           WAIT_FOR_PENDING: ${{ github.event_name == 'pull_request' && inputs.wait_for_pending_checks }}
@@ -639,9 +640,27 @@ jobs:
             others=$(echo "$rows" | jq -c --arg wf "$SELF_WORKFLOW" '[.[] | select(.workflow != $wf)]')
             total=$(echo "$others" | jq 'length')
             pending_checks=$(echo "$others" | jq '[.[] | select(.bucket == "pending")] | length')
-            # A required workflow that hasn't reported yet counts as pending.
-            absent=$(jq -n --argjson req "$REQUIRED_CHECK_WORKFLOWS" --argjson rows "$others" \
-              '[$req[] | select(. as $w | [$rows[] | .workflow] | index($w) | not)] | length')
+            # A required workflow that hasn't reported yet counts as pending. A name no
+            # workflow reported may instead be a commit status context (a check run
+            # outside Actions): it counts as met only when the newest status of that
+            # context on this head is `success` and was posted by the owner or a
+            # trusted_senders login. One posted by anyone else, a PR's own workflow
+            # included, counts for nothing, so the name stays pending.
+            missing=$(jq -nc --argjson req "$REQUIRED_CHECK_WORKFLOWS" --argjson rows "$others" \
+              '[$req[] | select(. as $w | [$rows[] | .workflow] | index($w) | not)]')
+            absent=0
+            if [ "$missing" != "[]" ]; then
+              if ! statuses=$(gh_read api "repos/$REPO/commits/$head/statuses?per_page=100"); then
+                cannot_verify "the commit statuses" "$RUNNER_TEMP/read-error.txt"
+                continue
+              fi
+              absent=$(jq -n --argjson miss "$missing" --argjson st "$statuses" --argjson trusted "$TRUSTED" '
+                ($trusted + ["3h4x"] | map(ascii_downcase)) as $ok
+                | [$miss[] | . as $c | ([$st[] | select(.context == $c)] | first) as $s
+                   | select(($s.state // "") != "success"
+                       or ($ok | index(($s.creator.login // "") | ascii_downcase)) == null)]
+                | length')
+            fi
             failed=$(echo "$others" | jq '[.[] | select(.bucket == "fail" or .bucket == "cancel")] | length')
 
             # So does a pull_request run of this head that has not completed, check or
