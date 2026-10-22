@@ -34,6 +34,8 @@ Shared GitHub Actions workflows for datacrash-io repositories.
   blocks, and a PR with no review label is not blocked by that alone: `required_check_workflows`
   already waits for the review's check on the current head. A repository that lets minor
   findings merge drops `review:minor` here (and from its review's `hold_on`); `''` turns it off.
+  `review:pending` (a head an external reviewer has not reviewed yet, see the review's `engine`)
+  always blocks, whatever the list says, and removing it starts a merge like a blocking label.
 
   **Dependabot PRs merge on their own** (`merge_dependabot`, default `true`; set `false` to
   merge them by hand). On the `workflow_run` path a run Dependabot started is let through,
@@ -220,6 +222,13 @@ jobs:
   with Workload Identity Federation when the caller passes the `anthropic_*` identifiers and
   grants `id-token: write` (no stored key), otherwise with the `ANTHROPIC_API_KEY` secret;
   skipped with a notice when it has neither. Skips drafts and bot PRs.
+  **External reviewer** (`engine: external`, or the caller's variable `REVIEW_ENGINE=external` on
+  the repository or the organization when the input is empty): the job calls no model and needs
+  no credential. It adds `review:pending` to the head and removes the verdict label of an earlier
+  head; automerge always refuses `review:pending`. The external reviewer posts its review with the
+  same marker and replaces `review:pending` with the verdict label, and that `unlabeled` event
+  starts automerge. If the job cannot add the label, it fails the check. Unset the variable to
+  review here again.
 
 Caller for both (`.github/workflows/security-review.yml`). Trigger the review only on
 `opened`/`reopened`/`ready_for_review`, not `synchronize`, so a PR is reviewed once rather

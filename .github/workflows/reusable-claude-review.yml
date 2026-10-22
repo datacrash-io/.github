@@ -25,6 +25,13 @@ name: Reusable - Claude PR Review
 # token is exchanged for a short-lived Anthropic token); otherwise the
 # ANTHROPIC_API_KEY secret.
 #
+# External reviewer: with the input `engine` (or, when it is empty, the caller's variable
+# REVIEW_ENGINE, set on the repository or the organization) equal to `external`, this job calls
+# no model and needs no credential. It only drops the verdict label of an earlier head and
+# adds `review:pending`, which automerge always refuses; the external reviewer reviews the
+# head, posts the review with the same marker and swaps `review:pending` for the verdict
+# label. Unset = this workflow reviews, as before.
+#
 # Cost: after the first review of a PR, a push is reviewed incrementally (only the
 # commits since the last reviewed head, plus the earlier review and its open threads);
 # see review.mjs for when it falls back to a full review. Incremental mode needs
@@ -82,6 +89,11 @@ on:
         required: false
         type: string
         default: 'datacrash-chaos-agent[bot]'
+      engine:
+        description: "Who reviews: empty = the caller's REVIEW_ENGINE variable, and when that is empty too, this workflow. 'external' = an external reviewer: the job only labels the head review:pending (automerge refuses it) and removes the verdict label of an earlier head; it calls no model and needs no credential. Any other value is treated as empty."
+        required: false
+        type: string
+        default: ''
       anthropic_federation_rule_id:
         description: "Workload Identity Federation rule (fdrl_...). With the organization and service account IDs, authenticates through the job's GitHub OIDC token instead of ANTHROPIC_API_KEY. The caller must grant `id-token: write`. These are identifiers, not secrets; keep them in the (private) caller, not here."
         required: false
@@ -140,10 +152,51 @@ jobs:
           echo "::error title=No Claude review for fork PRs::This PR comes from a fork, which gets no credentials to review it or to hold it. Merge it by hand after reviewing it."
           exit 1
 
+      # External reviewer (see the top of this file): label the head and stop here. The
+      # verdict labels of an earlier head go, so a fix push never merges on an old verdict.
+      - name: Hand the review to the external reviewer
+        id: handoff
+        if: (inputs.engine || vars.REVIEW_ENGINE) == 'external'
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          echo "external=true" >> "$GITHUB_OUTPUT"
+          pending=review:pending
+          head=$(gh pr view "$PR_NUMBER" --repo "$REPO" --json headRefOid --jq .headRefOid)
+          if [ "$head" != "$HEAD_SHA" ]; then echo "A newer push is being handed over; leaving the labels to it."; exit 0; fi
+          labels=$(gh api "repos/$REPO/issues/$PR_NUMBER/labels" --paginate --jq '.[].name')
+          # Always with colour and description: without them --force re-colours the label.
+          gh label create "$pending" --repo "$REPO" --force --color C5DEF5 --description "Waiting for the review of this head" \
+            || echo "::warning::Could not create or update the $pending label; adding it anyway."
+          if ! grep -qxF "$pending" <<<"$labels"; then
+            gh api --method POST "repos/$REPO/issues/$PR_NUMBER/labels" -f "labels[]=$pending" >/dev/null
+          fi
+          for other in review:lgtm review:minor review:changes review:missing; do
+            if grep -qxF "$other" <<<"$labels"; then
+              gh api --method DELETE "repos/$REPO/issues/$PR_NUMBER/labels/${other/:/%3A}" >/dev/null
+              echo "Removed $other."
+            fi
+          done
+          echo "::notice title=Review handed over::$pending on $HEAD_SHA; the external reviewer replaces it with its verdict."
+
+      # The handover could not label the head: fail this check, so automerge refuses the PR
+      # instead of merging an unreviewed head. Re-run the job to retry.
+      - name: Fail if the handover did not label the head
+        if: steps.handoff.outputs.external == 'true' && steps.handoff.outcome == 'failure'
+        run: |
+          echo "::error title=Review not handed over::Could not label this head review:pending. Re-run this job."
+          exit 1
+
       # Runs on every push as well (callers trigger on synchronize): automerge waits for
       # this check on the current head, so no commit merges unreviewed.
       - name: Choose how to authenticate
         id: key
+        if: steps.handoff.outputs.external != 'true'
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           FEDERATION_RULE: ${{ inputs.anthropic_federation_rule_id }}
@@ -241,7 +294,7 @@ jobs:
       # hold_on set, the hold label (label_mode hold) until a review completes.
       - name: Label the PR review:missing if no review ran
         if: >-
-          always() && inputs.label_mode != 'hold' &&
+          always() && inputs.label_mode != 'hold' && steps.handoff.outputs.external != 'true' &&
           (steps.key.outputs.present != 'true' || steps.review.outcome == 'failure')
         continue-on-error: true
         env:
@@ -279,7 +332,7 @@ jobs:
 
       - name: Hold the PR if no review ran
         if: >-
-          always() && inputs.label_mode == 'hold' && inputs.hold_on != '' &&
+          always() && inputs.label_mode == 'hold' && inputs.hold_on != '' && steps.handoff.outputs.external != 'true' &&
           (steps.key.outputs.present != 'true' || steps.review.outcome == 'failure')
         continue-on-error: true
         env:
