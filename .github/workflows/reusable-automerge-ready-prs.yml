@@ -499,9 +499,15 @@ jobs:
             echo "proceed=true"
           } >> "$GITHUB_OUTPUT"
 
+      # The variable AUTOMERGE_ENGINE (organization or repository) set to `tamtam` hands every merge except
+      # Dependabot's own PRs to an external merger; unset or any other value keeps the merge here.
+      - name: Leave the merge to an external merger
+        if: steps.pr.outputs.proceed == 'true' && vars.AUTOMERGE_ENGINE == 'tamtam' && steps.pr.outputs.dependabot != 'true'
+        run: echo "::notice::AUTOMERGE_ENGINE is tamtam, so an external merger merges this PR; this run does not."
+
       - name: Wait for all other checks to pass, then merge
         id: merge
-        if: steps.pr.outputs.proceed == 'true'
+        if: steps.pr.outputs.proceed == 'true' && (vars.AUTOMERGE_ENGINE != 'tamtam' || steps.pr.outputs.dependabot == 'true')
         continue-on-error: ${{ github.event_name == 'workflow_run' }}
         env:
           GH_TOKEN: ${{ secrets.AUTOMERGE_TOKEN || secrets.GITHUB_TOKEN }}
