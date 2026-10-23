@@ -58,6 +58,9 @@ commit messages.
   pushed), or, with `merge_dependabot`, a PR that is Dependabot's end to end (author, branch,
   every commit) whose metadata lists only patch/minor updates. Any read that fails, or
   metadata it cannot parse, means "do not merge" and a green run, never a drafted PR.
+  A `review_senders` login (an external reviewer) is trusted for removing `review:pending` and
+  for posting a required review status, nothing else, and its event never vouches for the PR itself: it gets the same checks as
+  a finished run's PR. Keep it that narrow.
   Don't loosen one of these to make a stuck PR merge; merge it by hand instead.
 - **Runner:** take the label from a `runs_on` input. Don't hardcode `ubuntu-latest`.
 - **Least privilege:** declare `permissions:` explicitly at the top level, and set

@@ -21,6 +21,13 @@ Shared GitHub Actions workflows for datacrash-io repositories.
   or commas (default `review:approved chaos-reviewed`, the current name and the older one), and
   any one that meets the rules counts.
 
+  An external reviewer that removes `review:pending` once it has labelled the head with its verdict
+  can start the merge without being a trusted sender: list its login in `review_senders` (a JSON
+  array, or the variable `AUTOMERGE_REVIEW_SENDERS` on the organization or a repository). That login
+  is trusted for that one event only, never for a push, readying a PR or any other label, and the PR
+  must still pass the checks of a finished run's PR (readied by a trusted sender, reviewed with
+  `review_label`, or Dependabot's own).
+
   When a merge attempt fails, the PR stays ready by default (`draft_on_failure`, default
   `false`): it gets one comment per head commit, and the next push or finished check run
   retries the merge. With `draft_on_failure: true` it is moved back to draft and waits until
@@ -36,7 +43,8 @@ Shared GitHub Actions workflows for datacrash-io repositories.
   blocks, and a PR with no review label is not blocked by that alone: `required_check_workflows`
   already waits for the review's check on the current head. An entry there may also name a commit
   status context instead of a workflow (an external reviewer's): it is met only by the newest status of
-  that context on the head in state `success`, posted by the owner or a `trusted_senders` login. A repository that lets minor
+  that context on the head in state `success`, posted by the owner, a `trusted_senders` login or a
+  `review_senders` login. A repository that lets minor
   findings merge drops `review:minor` here (and from its review's `hold_on`); `''` turns it off.
   `review:pending` (a head an external reviewer has not reviewed yet, see the review's `engine`)
   always blocks, whatever the list says, and removing it starts a merge like a blocking label.
