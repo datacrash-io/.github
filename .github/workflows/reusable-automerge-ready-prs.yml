@@ -51,7 +51,9 @@ on:
           the review only: the PR then merges
           only as a finished run's PR does (readied by a trusted sender, reviewed
           with review_label, or Dependabot's own), and a verdict label in
-          blocking_labels still stops it. Their other events (a push, readying a
+          blocking_labels still stops it. Who pushed the head is not checked: the
+          reviewer's verdict covers that head, so list only a reviewer that
+          labels the exact head it reviewed. Their other events (a push, readying a
           PR, any other label) are not trusted, and on the `workflow_run` path
           they are not trusted at all. The variable `AUTOMERGE_REVIEW_SENDERS`
           (organization or repository) overrides it. Default: none.
