@@ -2,8 +2,9 @@
 # pull_request run of that head has completed, then dispatches post_merge_workflows.
 #
 # - pull_request (a trusted sender's ready/sync event, or one removing hold_label or a
-#   blocking label; a review_senders login is trusted only to remove review:pending):
-#   merges when the checks allow it, polling or not per wait_for_pending_checks.
+#   blocking label): merges when the checks allow it, polling or not per
+#   wait_for_pending_checks. A review_senders login is trusted only to remove
+#   review:pending, and its PR must pass the workflow_run path's checks below.
 # - workflow_run (a listed PR workflow finished): checks once and exits. Merges a PR a
 #   trusted sender readied (or whose current head a trusted user approved with
 #   review_label), when a trusted sender started the finished run, and, with
@@ -45,10 +46,13 @@ on:
           JSON array (as a string) of GitHub logins, besides the owner and
           trusted_senders, trusted for one event only: removing `review:pending` from
           a PR, which an external reviewer does once it has labelled the head with
-          its verdict. Their other events (a push, readying a PR, any other label)
-          are not trusted, and on the `workflow_run` path they are not trusted at
-          all. The variable `AUTOMERGE_REVIEW_SENDERS` (organization or repository)
-          overrides it. Default: none.
+          its verdict. That event vouches for the review only: the PR then merges
+          only as a finished run's PR does (readied by a trusted sender, reviewed
+          with review_label, or Dependabot's own), and a verdict label in
+          blocking_labels still stops it. Their other events (a push, readying a
+          PR, any other label) are not trusted, and on the `workflow_run` path
+          they are not trusted at all. The variable `AUTOMERGE_REVIEW_SENDERS`
+          (organization or repository) overrides it. Default: none.
         required: false
         type: string
         default: '[]'
@@ -271,20 +275,39 @@ jobs:
           RUN_NAME: ${{ github.event.workflow_run.name }}
           RUN_ACTOR: ${{ github.event.workflow_run.actor.login }}
           RUN_TRIGGERING_ACTOR: ${{ github.event.workflow_run.triggering_actor.login }}
+          SENDER: ${{ github.event.sender.login }}
           TRUSTED: ${{ inputs.trusted_senders }}
           MERGE_DEPENDABOT: ${{ inputs.merge_dependabot }}
           REVIEW_LABEL: ${{ inputs.review_label }}
         run: |
           set -euo pipefail
 
+          # The owner or a trusted_senders login, compared without case as the job's
+          # `if` compares them (GitHub logins are case-insensitive).
+          is_listed() {
+            [ -n "$1" ] && jq -e --arg u "$1" '(. + ["3h4x"]) | map(ascii_downcase) | index($u | ascii_downcase) != null' <<<"$TRUSTED" >/dev/null
+          }
+
+          # A trusted sender's own event vouches for the PR. A review_senders login's (the
+          # job's `if` lets one through only for removing review:pending) vouches for its
+          # review alone, so that PR must pass the checks a finished run's PR does below:
+          # readied by a trusted sender, reviewed with review_label, or Dependabot's own.
+          started_trusted=true
           if [ "$EVENT" = "pull_request" ]; then
-            {
-              echo "number=$PR_NUMBER"
-              echo "head_sha=$PR_HEAD_SHA"
-              echo "head_ref=$PR_HEAD_REF"
-              echo "proceed=true"
-            } >> "$GITHUB_OUTPUT"
-            exit 0
+            if is_listed "$SENDER"; then
+              {
+                echo "number=$PR_NUMBER"
+                echo "head_sha=$PR_HEAD_SHA"
+                echo "head_ref=$PR_HEAD_REF"
+                echo "proceed=true"
+              } >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            RUN_PR_NUMBER="$PR_NUMBER"
+            RUN_HEAD_SHA="$PR_HEAD_SHA"
+            RUN_NAME="the removal of review:pending by $SENDER"
+          elif ! { is_listed "$RUN_ACTOR" && is_listed "$RUN_TRIGGERING_ACTOR"; }; then
+            started_trusted=false
           fi
 
           number="$RUN_PR_NUMBER"
@@ -317,11 +340,7 @@ jobs:
           head_sha=$(jq -r .headRefOid <<<"$pr")
           readied_by=$(jq -r '.timelineItems.nodes[0].actor.login // .author.login // empty' <<<"$pr")
 
-          # The owner or a trusted_senders login, compared without case as the job's
-          # `if` compares them (GitHub logins are case-insensitive).
-          is_trusted() {
-            [ -n "$1" ] && jq -e --arg u "$1" '(. + ["3h4x"]) | map(ascii_downcase) | index($u | ascii_downcase) != null' <<<"$TRUSTED" >/dev/null
-          }
+          is_trusted() { is_listed "$1"; }
 
           # Prints one "<dependency> <update type>" line per entry of the
           # `updated-dependencies:` YAML block Dependabot writes into its commit
@@ -480,12 +499,12 @@ jobs:
             skip="PR #$number is a draft"
           elif [ "$head_sha" != "$RUN_HEAD_SHA" ]; then
             skip="PR #$number has moved on to $head_sha; that commit's own checks will re-trigger this"
-          elif is_trusted "$RUN_ACTOR" && is_trusted "$RUN_TRIGGERING_ACTOR" && is_trusted "$readied_by"; then
-            : # the ordinary path: a trusted sender started the run and readied the PR
-          elif is_trusted "$RUN_ACTOR" && is_trusted "$RUN_TRIGGERING_ACTOR" && reviewed_head; then
+          elif [ "$started_trusted" = "true" ] && is_trusted "$readied_by"; then
+            : # the ordinary path: a trusted sender started the run (or a review sender finished its review) and readied the PR
+          elif [ "$started_trusted" = "true" ] && reviewed_head; then
             : # a trusted sender started the run and reviewed the current head (review_label)
           elif [ "$MERGE_DEPENDABOT" != "true" ]; then
-            if is_trusted "$RUN_ACTOR" && is_trusted "$RUN_TRIGGERING_ACTOR"; then
+            if [ "$started_trusted" = "true" ]; then
               skip="PR #$number was made ready by '$readied_by', who is not a trusted sender"
             else
               skip="$RUN_NAME was started by '$RUN_ACTOR' (this attempt by '$RUN_TRIGGERING_ACTOR'), not a trusted sender, and merge_dependabot is off"

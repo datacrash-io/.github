@@ -24,7 +24,9 @@ Shared GitHub Actions workflows for datacrash-io repositories.
   An external reviewer that removes `review:pending` once it has labelled the head with its verdict
   can start the merge without being a trusted sender: list its login in `review_senders` (a JSON
   array, or the variable `AUTOMERGE_REVIEW_SENDERS` on the organization or a repository). That login
-  is trusted for that one event only, never for a push, readying a PR or any other label.
+  is trusted for that one event only, never for a push, readying a PR or any other label, and the PR
+  must still pass the checks of a finished run's PR (readied by a trusted sender, reviewed with
+  `review_label`, or Dependabot's own).
 
   When a merge attempt fails, the PR stays ready by default (`draft_on_failure`, default
   `false`): it gets one comment per head commit, and the next push or finished check run
