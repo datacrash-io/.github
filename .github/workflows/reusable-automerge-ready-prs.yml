@@ -44,9 +44,11 @@ on:
       review_senders:
         description: >-
           JSON array (as a string) of GitHub logins, besides the owner and
-          trusted_senders, trusted for one event only: removing `review:pending` from
-          a PR, which an external reviewer does once it has labelled the head with
-          its verdict. That event vouches for the review only: the PR then merges
+          trusted_senders, trusted for two things only: removing `review:pending`
+          from a PR, which an external reviewer does once it has labelled the head
+          with its verdict, and posting a commit status named in
+          required_check_workflows (its review's status). That removal vouches for
+          the review only: the PR then merges
           only as a finished run's PR does (readied by a trusted sender, reviewed
           with review_label, or Dependabot's own), and a verdict label in
           blocking_labels still stops it. Their other events (a push, readying a
@@ -554,6 +556,7 @@ jobs:
           MERGE_STRATEGY: ${{ inputs.merge_strategy }}
           REQUIRED_CHECK_WORKFLOWS: ${{ inputs.required_check_workflows }}
           TRUSTED: ${{ inputs.trusted_senders }}
+          REVIEW_SENDERS: ${{ vars.AUTOMERGE_REVIEW_SENDERS != '' && vars.AUTOMERGE_REVIEW_SENDERS || inputs.review_senders }}
           HEAD_SHA: ${{ steps.pr.outputs.head_sha }}
           ALLOW_NO_CHECKS: ${{ inputs.allow_merge_with_no_checks }}
           WAIT_FOR_PENDING: ${{ github.event_name == 'pull_request' && inputs.wait_for_pending_checks }}
@@ -676,9 +679,10 @@ jobs:
             # A required workflow that hasn't reported yet counts as pending. A name no
             # workflow reported may instead be a commit status context (a check run
             # outside Actions): it counts as met only when the newest status of that
-            # context on this head is `success` and was posted by the owner or a
-            # trusted_senders login. One posted by anyone else, a PR's own workflow
-            # included, counts for nothing, so the name stays pending.
+            # context on this head is `success` and was posted by the owner, a
+            # trusted_senders login or a review_senders login (an external reviewer's
+            # own status). One posted by anyone else, a PR's own workflow included,
+            # counts for nothing, so the name stays pending.
             missing=$(jq -nc --argjson req "$REQUIRED_CHECK_WORKFLOWS" --argjson rows "$others" \
               '[$req[] | select(. as $w | [$rows[] | .workflow] | index($w) | not)]')
             absent=0
@@ -687,8 +691,8 @@ jobs:
                 cannot_verify "the commit statuses" "$RUNNER_TEMP/read-error.txt"
                 continue
               fi
-              absent=$(jq -n --argjson miss "$missing" --argjson st "$statuses" --argjson trusted "$TRUSTED" '
-                ($trusted + ["3h4x"] | map(ascii_downcase)) as $ok
+              absent=$(jq -n --argjson miss "$missing" --argjson st "$statuses" --argjson trusted "$TRUSTED" --argjson reviewers "$REVIEW_SENDERS" '
+                ($trusted + $reviewers + ["3h4x"] | map(ascii_downcase)) as $ok
                 | [$miss[] | . as $c | ([$st[] | select(.context == $c)] | first) as $s
                    | select(($s.state // "") != "success"
                        or ($ok | index(($s.creator.login // "") | ascii_downcase)) == null)]
