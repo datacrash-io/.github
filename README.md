@@ -21,6 +21,11 @@ Shared GitHub Actions workflows for datacrash-io repositories.
   or commas (default `review:approved chaos-reviewed`, the current name and the older one), and
   any one that meets the rules counts.
 
+  An external reviewer that removes `review:pending` once it has labelled the head with its verdict
+  can start the merge without being a trusted sender: list its login in `review_senders` (a JSON
+  array, or the variable `AUTOMERGE_REVIEW_SENDERS` on the organization or a repository). That login
+  is trusted for that one event only, never for a push, readying a PR or any other label.
+
   When a merge attempt fails, the PR stays ready by default (`draft_on_failure`, default
   `false`): it gets one comment per head commit, and the next push or finished check run
   retries the merge. With `draft_on_failure: true` it is moved back to draft and waits until

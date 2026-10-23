@@ -2,8 +2,8 @@
 # pull_request run of that head has completed, then dispatches post_merge_workflows.
 #
 # - pull_request (a trusted sender's ready/sync event, or one removing hold_label or a
-#   blocking label): merges when the checks allow it, polling or not per
-#   wait_for_pending_checks.
+#   blocking label; a review_senders login is trusted only to remove review:pending):
+#   merges when the checks allow it, polling or not per wait_for_pending_checks.
 # - workflow_run (a listed PR workflow finished): checks once and exits. Merges a PR a
 #   trusted sender readied (or whose current head a trusted user approved with
 #   review_label), when a trusted sender started the finished run, and, with
@@ -40,6 +40,18 @@ on:
         required: false
         type: string
         default: ''
+      review_senders:
+        description: >-
+          JSON array (as a string) of GitHub logins, besides the owner and
+          trusted_senders, trusted for one event only: removing `review:pending` from
+          a PR, which an external reviewer does once it has labelled the head with
+          its verdict. Their other events (a push, readying a PR, any other label)
+          are not trusted, and on the `workflow_run` path they are not trusted at
+          all. The variable `AUTOMERGE_REVIEW_SENDERS` (organization or repository)
+          overrides it. Default: none.
+        required: false
+        type: string
+        default: '[]'
       trusted_senders:
         description: >-
           JSON array (as a string) of GitHub logins, besides the repository owner
@@ -223,7 +235,9 @@ jobs:
     # own branch and commits, patch/minor updates only), never on who readied it.
     # Every other run is skipped here, before a runner is requested.
     if: >-
-      (github.event_name == 'pull_request' && github.event.pull_request.draft == false && (github.event.sender.login == '3h4x' || contains(fromJSON(inputs.trusted_senders), github.event.sender.login))
+      (github.event_name == 'pull_request' && github.event.pull_request.draft == false && (github.event.sender.login == '3h4x' || contains(fromJSON(inputs.trusted_senders), github.event.sender.login)
+          || (github.event.action == 'unlabeled' && github.event.label.name == 'review:pending'
+            && contains(fromJSON(vars.AUTOMERGE_REVIEW_SENDERS != '' && vars.AUTOMERGE_REVIEW_SENDERS || inputs.review_senders), github.event.sender.login)))
         && (github.event.action != 'unlabeled' || github.event.label.name == inputs.hold_label || github.event.label.name == 'review:pending'
           || contains(format(',{0},', (vars.AUTOMERGE_BLOCKING_LABELS != '' && vars.AUTOMERGE_BLOCKING_LABELS || inputs.blocking_labels)), format(',{0},', github.event.label.name))))
       || (github.event_name == 'workflow_run' && (github.event.workflow_run.event == 'pull_request' || github.event.workflow_run.event == 'pull_request_target')
